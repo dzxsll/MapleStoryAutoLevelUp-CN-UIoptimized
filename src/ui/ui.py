@@ -83,9 +83,41 @@ ADV_FIELD_HIDE = {
     #    中"用户会改"的那几个，见 create_potion_gbox 的说明。
     #    ⚠️ 档位列表（hp/mp）是嵌套结构，高级设置页渲染不了，必须收起来。
     'potion':         ['hp', 'mp'],
-    'nametag':        ['mode', 'global_diff_thres', 'split_width'],
-    'monster_detect': ['diff_thres', 'search_box_margin', 'contour_blur',
-                       'hp_bar_color', 'max_mob_area_trigger'],
+    'nametag':        ['mode', 'global_diff_thres', 'split_width',
+                       # 抗闪（2026-10-14）：算法内部阈值，用户改只会把定位搞乱
+                       'relax_ratio', 'relax_max_jump'],
+    # ⚠️ 不变量（2026-10-13 加）：**凡是有主界面控件的键，一律不进这个清单** ——
+    #    否则"主界面上露出来"与"高级设置里藏起来"两处口径打架，症状是
+    #    "在一个地方改了、另一个地方看不见"。`diff_thres` 与 `detect_range_scale_y`
+    #    就是因为这条从下面挪走的（它们现在是 create_monster_gbox 里的
+    #    「识别阈值」与「看得远倍数 Y」）。这条不变量由 tools/verify_monster_ui.py 盯着。
+    'monster_detect': ['search_box_margin', 'contour_blur',
+                       'verify_color', 'verify_color_tol', 'verify_min_ratio',
+                       'hp_bar_color', 'max_mob_area_trigger',
+                       # 2026-10-13「停下来打怪」：开关本身留在界面上给用户按，
+                       # 这两个是节奏/安全阀阈值，属于算法内部参数，收起来。
+                       'stop_attack_clear_frames', 'stop_attack_timeout_s',
+                       # 2026-10-14「目标锁定」：秒数是算法内部参数，收起来；
+                       # 用户要的"持续攻击到怪消失"由 stop_to_attack + 本键默认值兑现。
+                       'target_hold_s',
+                       # 2026-10-14「低频识别优化」：空窗秒数与两个追怪防抖参数
+                       # 都是算法内部参数，收起来（默认值就是标定过的口径）；
+                       # `engaged_scan` 是**开关**，留在界面上给用户按。
+                       'stop_attack_clear_s', 'approach_confirm_s',
+                       'approach_dir_min_s',
+                       # 2026-10-14「怪检测明细行」：纯观测日志开关，用户不用管
+                       # （要关就在配置文件里改 false），收起来免得面板膨胀。
+                       'detect_log', 'mob_engage_mode',
+                       # 2026-10-14「宽判定余量」：这是用户拍板要的旋钮，**不**收起
+                       # （留在界面上可调）；下面是内部参数才收。
+                       # 2026-10-13「看得远 + 走过去打」：开关（approach_mob）与
+                       # 倍数（detect_range_scale）都**留**给用户按/调 ——
+                       # 这两个正是"怪认不出来"时用户要动的那两个旋钮；
+                       # 高度容差与 stale 阈值是算法内部参数，收起来。
+                       'approach_dy_tol', 'stale_pos_full_frame_after',
+                       # 2026-10-14「丢名字存画面」：诊断开关，默认开，
+                       # 属于排查工具而不是日常旋钮 ⇒ 收起来（要关就改 yaml）。
+                       'miss_dump'],
     # 'route' 段 2026-09-14 起在界面上显示，但**只露 edge_guard_inset**
     # （用户要按地形调的那个）。其余全是算法阈值 / 回正线内部参数，
     # 改错只会把挂机搞坏 —— 一律收起来。
@@ -99,7 +131,24 @@ ADV_FIELD_HIDE = {
               'home_min_return_span', 'home_min_leave', 'home_min_frames',
               'home_timeout', 'home_rearm_margin', 'home_rearm_timeout',
               'home_reenter_lock', 'home_jump_band_max_drop',
-              'home_jump_band_inset', 'color_code', 'color_code_up_down'],
+              'home_jump_band_inset', 'color_code', 'color_code_up_down',
+              # 2026-10-14（用户拍板 A）：梯上让路的"真在爬"窗口。
+              #   与 ladder_leave_x 同口径 —— 算法判据，改错会把爬梯搞坏
+              #   （填 0 就退回"旗标为真一直让路"的老行为），不放界面。
+              'ladder_still_s',
+              # 2026-10-14（用户拍板 D）：绳梯脚下"蹭一下"自救。
+              #   同上：算法判据，改错会把爬梯搞坏（rope_nudge_s 填 0 就退回
+              #   "一直站着按 up"的老行为），不放界面。
+              'rope_nudge_s', 'rope_nudge_ms', 'rope_nudge_cycle_s',
+              'rope_nudge_max_s',
+              # 2026-10-14（用户拍板 E1）：goal 像素不再吃掉整帧。
+              #   同上：算法判据（填 0 退回"最近像素是谁就用谁"的老行为），不放界面；
+              #   判据不可用时本层自动不生效，见 _goal_pixel_skip_params()。
+              'goal_pixel_skip'],
+    # 🎥 demo_record（2026-10-14 加）：开/关、接管键盘、压缩、目录、单文件分钟数
+    #    都有主界面控件（create_demo_gbox）⇒ 一律**不**进本表（上面那条不变量）；
+    #    只剩三个算法内部键：记不记按键明细 / 隔几帧抽一帧 / 单文件最多几帧。
+    'demo_record': ['record_keys', 'every_n_frames', 'max_frames'],
 }
 
 class ConfigCombo(QComboBox):
@@ -777,7 +826,14 @@ class MainWindow(QMainWindow):
         self._potion_timer.start(2000)
 
         # Signal
-        self.request_close.connect(self.close)
+        # ★ 2026-10-14：原来这里直接 `connect(self.close)`。F12 走的是 pynput
+        #   **全局**键盘监听（src/input/KeyBoardListener.py:81-83；on_press 认 F 键时
+        #   **不看前台窗口**）⇒ 在任何窗口误按一下 F12，整个界面立刻关掉、挂机停止，
+        #   而且**一行日志都不打**（日志尾部只剩 closeEvent 那 6 行）。
+        #   用户真机现场：2026-10-14 03:40:48 就是这么退的（日志里既没有
+        #   [Attack Timeout] 也没有 run_once 异常 ⇒ 不是引擎自杀）。
+        #   现改成：先记日志 → 弹确认框（默认「取消」）→ 才关。见 _hotkey_f12_guarded。
+        self.request_close.connect(self._hotkey_f12_guarded)
         # 游戏内 F1~F4 热键 → 主界面功能（信号回主线程，pynput 线程只 emit）
         # 【冲突互斥】录制器占用 F1 暂停录制 / F2 截图 / F3 存路线 / F4 存地图，
         # 与主界面同名 —— 录制器运行期间主界面这四个热键**全部挂起**，退出后自动恢复。
@@ -822,9 +878,19 @@ class MainWindow(QMainWindow):
             #   · eng_to_cn 登记了 → 显示 "id (中文名)"
             #   · 没登记 eng_to_cn 但在 map_mobs_mapping 里（中文 ID 常见形态）
             #     → 直接显示 ID 本身，不再强迫用户登记两遍
-            if name in self.data.get("eng_to_cn", {}):
-                display_text = f"{name} ({self.data['eng_to_cn'][name]})"
-            elif name in self.data.get("map_mobs_mapping", {}):
+            # ⚠️ 2026-10-13（真机事故：**界面根本打不开**）：登记表里出现**裸头部**
+            #    （`map_mobs_mapping:` 后面一行都没有）时，yaml 解析出来是 None，
+            #    `name in None` 直接抛 `TypeError: argument of type 'NoneType'
+            #    is not iterable`。而本函数在启动链上（__init__ → setup_main_tab →
+            #    create_map_selection_gbox → refresh_map_list）⇒ 窗口还没显示就死。
+            #    触发条件：删掉最后一张已登记地图（写侧见 utils/registry.py 的
+            #    _drop_line_in_block，已同步修好）。这里 `or {}` 兜底，双保险：
+            #    即使登记表被手改坏，界面也照常打开（那张图只是不显示）。
+            _eng_to_cn = self.data.get("eng_to_cn") or {}
+            _map_mobs = self.data.get("map_mobs_mapping") or {}
+            if name in _eng_to_cn:
+                display_text = f"{name} ({_eng_to_cn[name]})"
+            elif name in _map_mobs:
                 display_text = name
             else:
                 continue  # 两处都没登记 = 不是给挂机用的地图
@@ -867,6 +933,10 @@ class MainWindow(QMainWindow):
         self.attack_gbox = self.create_attack_gbox()
         scroll_layout.addWidget(self.attack_gbox)
 
+        # 🐲 怪物识别（2026-10-13 加）—— 紧跟攻击设置，同为「打怪」类旋钮
+        self.monster_gbox = self.create_monster_gbox()
+        scroll_layout.addWidget(self.monster_gbox)
+
         # Key bindings group box
         self.key_binding_gbox = self.create_key_binding_gbox()
         scroll_layout.addWidget(self.key_binding_gbox)
@@ -887,10 +957,13 @@ class MainWindow(QMainWindow):
         self.potion_gbox = self.create_potion_gbox()
         scroll_layout.addWidget(self.potion_gbox)
 
+        # 🎥 示范录制（2026-10-14 加）—— 放在日志窗前面，同属「取样 / 排查」类
+        self.demo_gbox = self.create_demo_gbox()
+        scroll_layout.addWidget(self.demo_gbox)
+
         # Logger output window
         self.log_gbox = self.create_log_gbox()
         scroll_layout.addWidget(self.log_gbox)
-
         scroll_area.setWidget(scroll_widget)
 
         tab_main = QWidget()
@@ -1331,6 +1404,245 @@ class MainWindow(QMainWindow):
         layout.addLayout(columns)
         gbox.setLayout(layout)
         return gbox
+
+    # ── 🐲 怪物识别（2026-10-13 加，用户要求把这几个键做成主界面控件）─────────
+    # 为什么单开一组：高级设置页签 2026-09-12 移除后，`monster_detect` 这组键在界面上
+    #   **完全没有入口**，只能让 AI 手改 config_custom.yaml。而"看得远不远 / 要不要停下
+    #   打怪 / 识别阈值松紧"是用户按地图和手感要反复拧的旋钮 —— 属于"用户会改"的那类。
+    # ⚠️ 只把这 5 个键放上来；mode / verify_* / every_n_frames 等仍是算法内部参数
+    #    （为什么收起它们见 ADV_FIELD_HIDE 那一处）。
+    # ⚠️ 三处接线缺一不可（少一处 = 这个控件是装饰品）：
+    #    ① setup_main_tab() 里挂上；② apply_config_to_ui() 里灌值；③ update_cfg_from_main_ui()
+    #    里读回。tools/verify_monster_ui.py 就是钉这三处的（含真控件往返）。
+    def create_monster_gbox(self):
+        '''
+        怪物识别：monster_detect 里"用户会改"的 5 个键（2026-10-13 加）
+        '''
+        gbox = QGroupBox("🐲 怪物识别")
+
+        form_left = QFormLayout()
+        self.monster_stop_cb = QCheckBox("巡逻中停下来打完再走")
+        self.monster_stop_cb.setToolTip(
+            "勾上：索敌框里看到怪就站定，打完再走\n"
+            "（连续 2 个检测帧框里没怪才算打完；两条安全阀会强制放行，日志里有 WARNING）\n"
+            "取消：老行为 —— 边走边打")
+        form_left.addRow(self.monster_stop_cb)
+
+        self.monster_approach_cb = QCheckBox("够不着就走过去打")
+        self.monster_approach_cb.setToolTip(
+            "勾上：怪在攻击范围外、但在同一层（高度差 <= 60px）时朝它走一段\n"
+            "（跨层不硬走：上面的要爬梯子、下面的要跳，交给路线）")
+        form_left.addRow(self.monster_approach_cb)
+
+        form_right = QFormLayout()
+        self.monster_scale_x = QLineEdit()
+        self.monster_scale_x.setFixedWidth(60)
+        self.monster_scale_x.setToolTip(
+            "感知框 = 攻击框 + 搜索框外扩，再乘这个倍数。1 = 只看攻击范围那么远")
+        form_right.addRow("看得远倍数 X:", self.monster_scale_x)
+
+        self.monster_scale_y = QLineEdit()
+        self.monster_scale_y.setFixedWidth(60)
+        self.monster_scale_y.setToolTip(
+            "竖直方向单独收窄（省时间）：竖直多看没用 —— 够不着的不会横着走过去")
+        form_right.addRow("看得远倍数 Y:", self.monster_scale_y)
+
+        self.monster_diff_thres = QLineEdit()
+        self.monster_diff_thres.setFixedWidth(60)
+        self.monster_diff_thres.setToolTip(
+            "模板匹配的差异阈值（0~1）：越小越严格。越小越容易漏，越大越容易误报")
+        form_right.addRow("识别阈值:", self.monster_diff_thres)
+
+        # 2026-10-14 用户 m08016 拍板「B 够得着判据加余量」：这是他要反复拧的旋钮，
+        # 所以放上来（不是一个写死在代码里的常数）。读数依据见 config_default.yaml。
+        self.monster_engage_margin = QLineEdit()
+        self.monster_engage_margin.setFixedWidth(60)
+        self.monster_engage_margin.setToolTip(
+            "宽判定余量（px）：判「够得着」时把攻击框向外各扩这么多\n"
+            "人的眼睛是预估的（大概在范围内就会打），0 = 严格按技能框\n"
+            "示范录制读数：389 帧「看见了怪却判够不着」里 69% 只差 ≤45px ⇒ 默认 40")
+        form_right.addRow("宽判定余量(px):", self.monster_engage_margin)
+
+        columns = QHBoxLayout()
+        columns.addLayout(form_left)
+        columns.addSpacing(20)
+        columns.addLayout(form_right)
+
+        error_label = create_error_label()
+        self.monster_scale_x.editingFinished.connect(
+            lambda: validate_numerical_input(self.monster_scale_x.text(), error_label, 1, 20))
+        self.monster_scale_y.editingFinished.connect(
+            lambda: validate_numerical_input(self.monster_scale_y.text(), error_label, 1, 20))
+        self.monster_diff_thres.editingFinished.connect(
+            lambda: validate_numerical_input(self.monster_diff_thres.text(), error_label, 0, 1))
+        self.monster_engage_margin.editingFinished.connect(
+            lambda: validate_numerical_input(
+                self.monster_engage_margin.text(), error_label, 0, 200))
+
+        layout = QVBoxLayout()
+        layout.addWidget(error_label)
+        layout.addLayout(columns)
+        gbox.setLayout(layout)
+        return gbox
+
+    def _apply_monster_ui(self):
+        '''
+        把 cfg["monster_detect"] 的值灌进上面那 5 个控件（缺键用出厂默认值）
+        '''
+        md = self.cfg.get("monster_detect") or {}
+        try:
+            self.monster_stop_cb.setChecked(bool(md.get("stop_to_attack", True)))
+            self.monster_approach_cb.setChecked(bool(md.get("approach_mob", True)))
+            self.monster_scale_x.setText(str(md.get("detect_range_scale", 2.0)))
+            self.monster_scale_y.setText(str(md.get("detect_range_scale_y", 1.1)))
+            self.monster_diff_thres.setText(str(md.get("diff_thres", 0.8)))
+            self.monster_engage_margin.setText(str(md.get("mob_engage_margin", 40)))
+        except AttributeError:
+            # 控件还没建（构造顺序变了 / 单测里的裸实例）—— 当场不炸，等用户真点保存
+            pass
+
+    def _read_monster_ui(self):
+        '''
+        读那 5 个控件 → 就地写回 cfg["monster_detect"]（**不动**同一段里别的键）
+
+        ⚠️ 就地写的原因：`monster_detect` 段里还有 mode / verify_* / every_n_frames 等
+           算法内部键，本界面不管它们；整段替换会把它们冲掉。
+        '''
+        def _num(text, old, cast):
+            try:
+                return cast(str(text).strip())
+            except (TypeError, ValueError):
+                # 输入框被清空/填了非数字：保留原值，别把配置写成 None
+                return old
+
+        md = self.cfg.setdefault("monster_detect", {})
+        md["stop_to_attack"] = bool(self.monster_stop_cb.isChecked())
+        md["approach_mob"] = bool(self.monster_approach_cb.isChecked())
+        md["detect_range_scale"] = _num(self.monster_scale_x.text(),
+                                        md.get("detect_range_scale", 2.0), float)
+        md["detect_range_scale_y"] = _num(self.monster_scale_y.text(),
+                                          md.get("detect_range_scale_y", 1.1), float)
+        md["diff_thres"] = _num(self.monster_diff_thres.text(),
+                                md.get("diff_thres", 0.8), float)
+        # 宽判定余量：允许写 "40" / "40.0"，超范围夹住（与 validate_numerical_input 的 0~200 一致）
+        try:
+            _mg = int(float(str(self.monster_engage_margin.text()).strip()))
+            md["mob_engage_margin"] = max(0, min(200, _mg))
+        except (TypeError, ValueError):
+            md["mob_engage_margin"] = int(md.get("mob_engage_margin", 40) or 0)
+        return md
+
+    # ── 🎥 示范录制（2026-10-14 加，用户要求"我自己操作，录下来当样本"）────────
+    # 为什么单开一组：同「怪物识别」的理由 —— 高级设置页签 2026-09-12 移除后，
+    #   `demo_record` 这组键在界面上**没有任何入口**，用户想录一次只能让 AI 改 yaml。
+    # ⚠️ 三处接线缺一不可（少一处 = 这个控件是装饰品，见 tools/verify_demo_ui.py）：
+    #    ① setup_main_tab() 里挂上；② apply_config_to_ui() 里灌值；
+    #    ③ update_cfg_from_main_ui() 里读回 —— 并且 `demo_record` 必须进
+    #    `_MANAGED_SECTIONS`（否则 3 秒自动保存会拿磁盘旧值盖掉界面值，静默失效）。
+    # ⚠️ 勾上「开示范录制」+「接管键盘」之后，机器人**一个键都不发**，全靠你自己玩 ——
+    #    这是刻意的：录制期间要的是"人的操作"，不是机器人的操作（引擎照常感知、照常
+    #    算影子决策，但按键被 kb.disable() 彻底静音）。
+    def create_demo_gbox(self):
+        '''
+        示范录制：demo_record 里"用户会改"的 5 个键（2026-10-14 加）
+        '''
+        gbox = QGroupBox("🎥 示范录制（你玩，它录）")
+
+        form_left = QFormLayout()
+        self.demo_enabled_cb = QCheckBox("开示范录制")
+        self.demo_enabled_cb.setToolTip(
+            "勾上：点「开始」之后，把每一帧的怪物检测与你按的键录到文件里\n"
+            "（录完把目录交给 AI，用 tools/analyze_demo.py 出对照报告）\n"
+            "不勾：完全不录，也没有任何额外开销")
+        form_left.addRow(self.demo_enabled_cb)
+
+        self.demo_record_only_cb = QCheckBox("录制时接管键盘（机器人不出手）")
+        self.demo_record_only_cb.setToolTip(
+            "勾上（推荐）：录制期间**键盘静音**，机器人一个键都不发，完全由你操作 ——\n"
+            "这样录到的才是「人怎么打」，不是「机器人怎么打」\n"
+            "取消：机器人照常挂机，你的按键也会被一起记下来")
+        form_left.addRow(self.demo_record_only_cb)
+
+        form_right = QFormLayout()
+        self.demo_out_dir = QLineEdit()
+        self.demo_out_dir.setFixedWidth(160)
+        self.demo_out_dir.setToolTip(
+            "存到哪个目录（相对程序目录；默认 debug/demo）\n"
+            "录出来的是 demo_*.jsonl.gz + 同名的 _meta.json")
+        form_right.addRow("存到目录:", self.demo_out_dir)
+
+        self.demo_max_minutes = QLineEdit()
+        self.demo_max_minutes.setFixedWidth(60)
+        self.demo_max_minutes.setToolTip(
+            "单个文件最长录多少分钟，到点自动换下一个文件（0 = 不限制）")
+        form_right.addRow("单个文件 分钟:", self.demo_max_minutes)
+
+        self.demo_gzip_cb = QCheckBox("压缩存盘（.gz）")
+        self.demo_gzip_cb.setToolTip(
+            "约省 8 倍空间（1 分钟约 1.3MB → 160KB 左右），代价是 CPU 略高")
+        form_right.addRow(self.demo_gzip_cb)
+
+        columns = QHBoxLayout()
+        columns.addLayout(form_left)
+        columns.addSpacing(20)
+        columns.addLayout(form_right)
+
+        error_label = create_error_label()
+        self.demo_max_minutes.editingFinished.connect(
+            lambda: validate_numerical_input(self.demo_max_minutes.text(),
+                                             error_label, 0, 600))
+
+        layout = QVBoxLayout()
+        layout.addWidget(error_label)
+        layout.addLayout(columns)
+        gbox.setLayout(layout)
+        return gbox
+
+    def _apply_demo_ui(self):
+        '''
+        把 cfg["demo_record"] 的值灌进上面那 5 个控件（缺键用出厂默认值）
+        '''
+        dd = self.cfg.get("demo_record") or {}
+        try:
+            self.demo_enabled_cb.setChecked(bool(dd.get("enabled", False)))
+            self.demo_record_only_cb.setChecked(bool(dd.get("record_only", True)))
+            self.demo_gzip_cb.setChecked(bool(dd.get("gzip", True)))
+            self.demo_out_dir.setText(str(dd.get("out_dir", "debug/demo")))
+            self.demo_max_minutes.setText(str(dd.get("max_minutes", 30)))
+        except AttributeError:
+            # 控件还没建（构造顺序变了 / 单测里的裸实例）—— 当场不炸
+            pass
+
+    def _read_demo_ui(self):
+        '''
+        读那 5 个控件 → 就地写回 cfg["demo_record"]（**不动**同一段里别的键）
+
+        ⚠️ 就地写的原因：`demo_record` 段里还有 record_keys / every_n_frames /
+           max_frames 等算法内部键，本界面不管它们；整段替换会把它们冲掉。
+        '''
+        def _num(text, old, cast):
+            try:
+                return cast(str(text).strip())
+            except (TypeError, ValueError):
+                # 输入框被清空/填了非数字：保留原值，别把配置写成 None
+                return old
+
+        def _mins(text, old):
+            '''分钟数：整数就写成整数（别把 30 写成 30.0，配置要好看也好读）'''
+            try:
+                v = float(str(text).strip())
+            except (TypeError, ValueError):
+                return old
+            return int(v) if float(v).is_integer() else v
+
+        dd = self.cfg.setdefault("demo_record", {})
+        dd["enabled"] = bool(self.demo_enabled_cb.isChecked())
+        dd["record_only"] = bool(self.demo_record_only_cb.isChecked())
+        dd["gzip"] = bool(self.demo_gzip_cb.isChecked())
+        dd["out_dir"] = str(self.demo_out_dir.text()).strip() or "debug/demo"
+        dd["max_minutes"] = _mins(self.demo_max_minutes.text(),
+                                  dd.get("max_minutes", 30))
+        return dd
 
     def create_pickup_gbox(self):
         '''
@@ -2066,7 +2378,11 @@ class MainWindow(QMainWindow):
         把新标定结果覆盖回旧值（换号必踩）。段级合并后：主界面管理的段
         （bot/key/攻击/buff）以界面为准，其余段（nametag 等）以磁盘为准。
         '''
-        managed = ('bot', 'key', 'directional_attack', 'aoe_skill', 'buff_skill')
+        # ⚠️ 只留**一处**清单：类属性 `_MANAGED_SECTIONS`（见下面）。原来这里把同一份
+        #    字面量写了两遍 —— 正是"同一判据抄两处、改一处漏一处"的典型形态
+        #    （全局 AGENTS.md 第 6 条点名的故障形态）。2026-10-13 给 monster_detect
+        #    加界面控件时，差点就只改了这一处、把另一处漏掉。
+        managed = self._MANAGED_SECTIONS
         try:
             # 静默读（yaml.safe_load 直读）—— 本函数被 3 秒定时器反复调用，
             # 走 load_yaml 会每 3 秒打两条 INFO 刷屏日志（2026-09-12 用户实测）
@@ -2095,7 +2411,20 @@ class MainWindow(QMainWindow):
     # ---- 配置方案下拉框（2026-09-12 用户设计：新建/切换/自动保存三合一）----
     # 主界面管理的段（保存时以界面为准，防止工具写盘的结果被覆盖的合并逻辑见
     # _merge_disk_owned_sections；其余段以磁盘为准）。
-    _MANAGED_SECTIONS = ('bot', 'key', 'directional_attack', 'aoe_skill', 'buff_skill')
+    # ★ 2026-10-13 加 `monster_detect`：这一段的 5 个键（stop_to_attack / approach_mob /
+    #   detect_range_scale / detect_range_scale_y / diff_thres）现在有主界面控件
+    #   （create_monster_gbox）。**不加进来的后果**：3 秒自动保存时
+    #   _merge_disk_owned_sections 会拿磁盘上的旧值盖掉界面刚改的值
+    #   ⇒ 症状是"控件点了一点反应都没有"，而且不报错（静默失效）。
+    #   ⚠️ 同一段里另外那些算法内部键**不会**因此丢：`_read_monster_ui()` 是就地写这 5 个键，
+    #      其余键原样留在 cfg 里（它们的值来自启动时的深合并）。
+    _MANAGED_SECTIONS = ('bot', 'key', 'directional_attack', 'aoe_skill', 'buff_skill',
+                         'monster_detect',
+                         # ★ 2026-10-14 加 `demo_record`：有主界面控件（create_demo_gbox）。
+                         #   不加进来的后果同 monster_detect —— 3 秒自动保存时
+                         #   _merge_disk_owned_sections 拿磁盘旧值盖掉界面新值 ⇒
+                         #   症状"勾了没反应"，且不报错（静默失效）。
+                         'demo_record')
 
     def _config_display_name(self, path):
         return os.path.splitext(os.path.basename(path))[0]
@@ -2248,7 +2577,7 @@ class MainWindow(QMainWindow):
         """🆕 点击后：输入框清空、进入「等待输入新方案名」状态，回车即创建。"""
         if not self._ask_confirm(
                 "新建配置方案",
-                "新建一套空方案？主界面设置（按键 / 攻击范围 / 增益 / 地图选择）将重置为出厂默认；\n"
+                "新建一套空方案？主界面设置（按键 / 攻击范围 / 怪物识别 / 增益 / 地图选择）将重置为出厂默认；\n"
                 "已标定的名字、路线、怪物模板等资源文件不受影响。\n\n"
                 "点「新建」后在输入框里输入新方案的名字，回车即创建。",
                 "新建", "取消"):
@@ -2392,6 +2721,12 @@ class MainWindow(QMainWindow):
         self.attack_cooldown.setText(str(atk_cfg["cooldown"]))
         self.attack_range_y.setText(str(atk_cfg["range_y"]))
 
+        # === 🐲 怪物识别（2026-10-13 加）===
+        self._apply_monster_ui()
+
+        # === 🎥 示范录制（2026-10-14 加）===
+        self._apply_demo_ui()
+
         # === Key Bindings ===
         key_cfg = self.cfg["key"]
         self.basic_attack_key.set_key(key_cfg["directional_attack"])
@@ -2440,6 +2775,9 @@ class MainWindow(QMainWindow):
             self.key_binding_gbox,
             self.buff_skill_gbox,
             self.map_selection_gbox,
+            # 🎥 示范录制（2026-10-14 加）：挂机中改录制参数没有任何作用
+            #   （录制器在点「开始」那一刻就建好了）⇒ 一起置灰，别让人以为改了会生效
+            self.demo_gbox,
         ]
         gboxs += list(self.advance_settings_gboxes.values())
         # Apply disable + style
@@ -2728,11 +3066,31 @@ class MainWindow(QMainWindow):
             cfg_path = "config/.config_tmp.yaml"
             save_yaml(self.cfg, cfg_path)
 
+            # 🎥 示范录制（2026-10-14 加）：开了录制就在日志里先说一句 ——
+            #    `record_only: true` 时**键盘是静音的**，机器人一个键都不发。
+            #    不说的话，用户点完「开始」看到角色一动不动，只会以为程序坏了
+            #    （这正是 2026-10-14 那次「红框里有绿框却不打」的同类症状：静默）。
+            _demo = self.cfg.get("demo_record") or {}
+            if _demo.get("enabled"):
+                if _demo.get("record_only", True):
+                    self.append_log(
+                        "[示范录制] 已开启且键盘静音 —— 这次**由你自己操作**，"
+                        "机器人不会动；录完把 debug/demo/ 里的文件交给开发者。",
+                        logging.WARNING)
+                else:
+                    self.append_log(
+                        "[示范录制] 已开启但**键盘没有静音** —— 机器人会照常挂机，"
+                        "录到的样本里混着机器人的操作（只有想对比时才这么用）。",
+                        logging.WARNING)
+
             # Start AutoBot
             ret = self.controller.start_bot(cfg_path)
 
             if ret == 0: # Start success
-                self.button_start_pause.setText("⏸ 暂停 (F1)")
+                # 🎥 录制中就在按钮上写出来 —— 这是用户唯一一直在看的地方
+                self.button_start_pause.setText(
+                    "⏸ 暂停 (F1) · 录制中" if (self.cfg.get("demo_record") or {}).get("enabled")
+                    else "⏸ 暂停 (F1)")
                 self.button_start_pause.setStyleSheet("background-color: lightgreen;")
                 self.set_gbox_enabled(False)
             elif ret == -2:
@@ -3123,6 +3481,35 @@ class MainWindow(QMainWindow):
         if self._hotkeys_suspended():
             return
         self.launch_route_recorder()
+
+    def _hotkey_f12_guarded(self):
+        """F12（全局热键）= 请求关闭挂机界面 —— **先留痕、再确认、才关**。
+
+        ⚠️ 为什么必须问一句（2026-10-14 用户真机，日志 03:40:48）：
+        F12 是 pynput **全局**热键（`src/input/KeyBoardListener.py:81-83`，
+        `on_press` `:109-128` 处理 F 键时**不检查前台窗口**；`run_for_autobot`
+        `:222-229` 只是空转），所以在**任何窗口**误按一下，整个界面立刻关掉、
+        挂机停止，而且原来连一行日志都不打 —— 事后完全看不出是谁关的
+        （日志尾部就只剩 closeEvent 的 6 行：Save yaml → Save UI state → Terminated）。
+
+        ⚠️ 与 F1~F4 的区别是**故意的**：F1~F4 在录制器运行期间要
+        `_hotkeys_suspended()` 给录制器让键；录制器不用 F12，所以这里**不挂起** ——
+        录制中按 F12 照样弹确认框。
+
+        默认按钮取「取消」：误按回车不会把挂机关掉。
+        """
+        logger.info("[热键] 按下 F12 —— 请求关闭挂机界面（会先确认）")
+        reply = QMessageBox.question(
+            self, "关闭挂机界面",
+            "确定要关闭挂机界面吗？\n\n"
+            "· 确定 = 保存设置并**停止挂机**、退出界面\n"
+            "· 取消 = 什么都不做，挂机继续\n\n"
+            "（F12 是全局热键：在任何窗口按到都会走到这里）",
+            QMessageBox.Ok | QMessageBox.Cancel, QMessageBox.Cancel)
+        if reply != QMessageBox.Ok:
+            logger.info("[热键] F12 的关闭请求已取消，挂机继续")
+            return
+        self.close()
 
     def launch_route_recorder(self):
         if not self._require_admin_for_hotkey_tools():
@@ -3748,6 +4135,12 @@ class MainWindow(QMainWindow):
             ao["cooldown"] = _num(self.attack_cooldown.text(), ao["cooldown"], float)
         else:
             logger.error(f"[update_cfg_from_main_ui] Unsupported attack mode: {self.cfg['bot']['attack']}")
+        # 🐲 怪物识别（2026-10-13 加）：就地写这 5 个键，**不动**同段其它键
+        #   （mode / verify_* / every_n_frames 仍是算法内部参数；见 _read_monster_ui 注释）
+        self._read_monster_ui()
+        # 🎥 示范录制（2026-10-14 加）：同样就地写这 5 个键，**不动**同段其它键
+        #   （record_keys / every_n_frames / max_frames 仍是算法内部参数）
+        self._read_demo_ui()
         # Key binding gbox
         self.cfg["key"]["teleport"] = _key(
             self.teleport_key, self.cfg["key"].get("teleport"))

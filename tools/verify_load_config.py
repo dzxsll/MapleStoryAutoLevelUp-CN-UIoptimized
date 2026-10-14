@@ -229,6 +229,53 @@ def main():
               f"{_ln['n_pts']} px，{'含跳跃' if _ln['has_jump'] else '无跳跃'}，"
               f"落点覆盖 x{_ln['cover_xs'][0]}~{_ln['cover_xs'][1]}")
 
+    print("\n【6】★ 同进程热重载 + 段数变少 ⇒ 段号必须被钳回（2026-10-14 真机停摆回归）")
+    # ⚠️ 复现的是这条真机链路（**两次**停摆：累计失败 149 帧 / 296 帧，角色彻底不动）：
+    #    界面【开始】(src/ui/AutoBotController.py:109) 在**同一个进程里**重跑
+    #    load_config → img_routes 被换成更短的列表（重录成更少段 / 有段被判废）
+    #    → idx_routes 还停在上一轮的值 → run_once 里按下标取 route ⇒ IndexError
+    #    ⇒ 崩溃点排在「路线推进」之前 ⇒ **每帧都炸**。
+    #    tools/verify_route_index_bounds.py 只能钉住单元级的钳位判据，真资源这一层
+    #    （load_config 真的会重建列表 + 真的会调钳位）只能在这里补。
+    if len(b.img_routes) >= 3:
+        import glob as _glob
+
+        import src.engine.MapleStoryAutoLevelUp as _E
+        _files = sorted(_glob.glob(os.path.join("minimaps", map_name, "route*.png")))
+        _files = [p for p in _files
+                  if not p.endswith("route_rest.png") and not p.endswith("route_home.png")]
+        _keep = _files[:2]
+        _real_glob = _glob.glob
+
+        def _fake_glob(pattern, *a, **k):
+            if "route" in str(pattern).replace("\\", "/"):
+                return list(_keep)
+            return _real_glob(pattern, *a, **k)
+
+        _old_idx = len(b.img_routes) - 1
+        b.idx_routes = _old_idx
+        _E.glob.glob = _fake_glob
+        try:
+            _ret = b.load_config(cfg)
+        finally:
+            _E.glob.glob = _real_glob
+        print(f"       热重载：{_old_idx + 1} 段 → {len(b.img_routes)} 段，"
+              f"段号 {_old_idx} → {b.idx_routes}")
+        check("★ 热重载没抛异常", _ret, 0)
+        check("★ 段号被钳回合法范围（否则主循环每帧 IndexError）",
+              0 <= b.idx_routes < len(b.img_routes), True)
+        # 反证：修复前那一行在同样状态下**必须**抛 —— 不抛说明夹具不成立（用例是假的）
+        try:
+            _ = b.img_routes[_old_idx]
+            check("★ 反证：旧段号在新列表上越界", "没抛", "IndexError")
+        except IndexError:
+            check("★ 反证：旧段号在新列表上越界", "IndexError", "IndexError")
+        # 还原成真实资源：下面收尾与人工排查看到的状态必须是真实的
+        b.load_config(cfg)
+    else:
+        print(f"       ⚠️ 跳过：本图只有 {len(b.img_routes)} 段，做不了「段数变少」的复现"
+              f"（数据不足，不是代码问题）")
+
     print("\n" + "=" * 60)
     if FAIL:
         print(f"❌ 自检失败 {len(FAIL)} 项：")

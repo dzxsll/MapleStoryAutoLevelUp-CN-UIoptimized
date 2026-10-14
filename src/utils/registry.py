@@ -126,7 +126,18 @@ def unregister_map(map_name, path=None):
                 removed = True
                 continue
             kept.append(line)
-        return (text[:pos] + ''.join(kept)) if removed else text, removed
+        if not removed:
+            return text, False
+        body = ''.join(kept)
+        # ⚠️ 2026-10-13（真机事故：**界面再也打不开**）：删掉**最后一条**登记时，
+        #    原写法会留下一个**裸头部**（`map_mobs_mapping:` 后面一行都没有）——
+        #    yaml 把它解析成 None，界面的 refresh_map_list 一 `name in None` 就抛
+        #    TypeError（那份函数在启动链上），窗口还没显示就死；引擎侧的直接下标
+        #    同样会炸。⇒ 段里一条缩进项都不剩时，写成显式的空表 `header: {}`。
+        first = next((ln for ln in body.splitlines() if ln.strip()), '')
+        if not re.match(r'[ \t]+\S', first):
+            return text[:m_head.start()] + f'{header}: {{}}\n' + body, True
+        return text[:pos] + body, True
 
     text, r1 = _drop_line_in_block(text, 'map_mobs_mapping', map_name)
     text, r2 = _drop_line_in_block(text, 'eng_to_cn', map_name)

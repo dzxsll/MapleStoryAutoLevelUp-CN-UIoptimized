@@ -43,6 +43,25 @@ class KeyBoardListener():
             keyboard.Key.right: "right",
             keyboard.Key.space: "space"
         }
+        # ★ 2026-10-13：**修饰键也要能当跳跃键**（`key.jump: alt` 是很常见的配法）。
+        #   根因：on_press 认键只有两条路 —— ① 普通字符键 `key.char.lower()`
+        #   ② `self.movement_keys.get(key)`。修饰键**没有 `.char`**（AttributeError），
+        #   只能走 ②；而 ② 的表里原来只有 up/down/left/right/space ⇒ k 恒为 None
+        #   ⇒ `if k and k == self._jump_key_name()` 恒假 ⇒ `_jump_pending` 永不置位
+        #   ⇒ 录制时**一次跳都记不下来**（全程静默、不报错；线里 0 个跳跃像素，
+        #   真机表现是「爬不上管子 / 走到该跳的地方不跳」；2026-10-13 用户
+        #   key.jump=alt 实测：route1/route2 只有 left/right 线 + 一个 goal 圆点）。
+        #   用 getattr 逐个试，平台缺哪个 Key 就跳过（不写死，换平台不会炸）。
+        for _names, _norm in (
+            (("alt", "alt_l", "alt_r", "alt_gr"), "alt"),
+            (("ctrl", "ctrl_l", "ctrl_r"), "ctrl"),
+            (("shift", "shift_l", "shift_r"), "shift"),
+            (("cmd", "cmd_l", "cmd_r"), "cmd"),
+        ):
+            for _n in _names:
+                _key = getattr(keyboard.Key, _n, None)
+                if _key is not None:
+                    self.movement_keys[_key] = _norm
         self.func_keys = {
             getattr(keyboard.Key, f"f{i+1}"): i for i in range(12)
         }

@@ -55,7 +55,7 @@ from src.engine.MapleStoryAutoLevelUp import MapleStoryAutoBot  # noqa: E402
 
 
 def _make_bot_with_fake_templates(draw_boxes, frame_shape=(200, 200, 3),
-                                  at=(150, 150), size=8):
+                                  at=(150, 150), size=12):
     '''造桩：塞一个「只在指定位置命中」的假模板，让真实实现自己产出怪，
     从而**真实执行**画框那一段。
 
@@ -290,7 +290,12 @@ check_true("get_monsters_in_range 里**不再画任何框**（降频 → 会闪�
 check_true("逐怪画框**在** update_info_on_img_frame_debug 里（每帧重画）",
            "draw_mob_boxes" in _src_info_fn and "cv2.rectangle(" in _src_info_fn)
 check_true("索敌框也**在**帧尾方法里（2026-09-29 挪过来，治闪烁）",
-           "search_box_margin" in _src_info_fn)
+           "get_search_box(" in _src_info_fn)
+check_true("★ 帧尾画框与怪检测走**同一个** get_search_box（2026-10-13 加感知框放大后"
+           "两处各算一遍必然漂移：画的框 ≠ 用的框）",
+           "get_search_box(" in _src_info_fn
+           and "get_search_box(" in inspect.getsource(
+               MapleStoryAutoBot.update_cmd_by_mob_detection))
 check_true("画框用的是 cv2.rectangle（不走 PIL 中文标签，避免拖帧）",
            "cv2.rectangle(" in _src_info_fn)
 check_true("有空值兜底（img_frame_debug is not None）",

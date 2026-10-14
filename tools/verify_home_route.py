@@ -539,6 +539,45 @@ if True:
     cmd_at_84 = (_sim_bot.cmd_move_x, _sim_bot.cmd_move_y, _sim_bot.cmd_action)
     check("对照：管柱真起点 (84,126) 正常发 up", cmd_at_84, ("none", "up", "none"))
 
+print("\n【6.7】★ 真绳梯在当前段图上（up 像素落在角色这一行）⇒ 必须发 up，不能照抄横向（2026-10-14）")
+# 真机反例（废铁2，17:22 场逐帧复刻）：角色走到 (162,78) 正踩在 x=163 那根绳梯脚下，
+# route1 里 (162,78)、(163,78) 是 up 像素、(163,75) 是同一列更上面的第二个竖向像素；
+# 而 route_home.png 全图的竖向像素只有 x=70..71 那 9 个（y=80..88）⇒ 旧版伪灰闸
+# （只拿回正线当参照）把**每一根真绳梯**都判成"地面伪灰" ⇒ 照抄横向 right
+# ⇒ 角色从绳梯脚下直接走过去、全程不按 up（真机 17:23:24 全局 (178,78) 指令 right none none）。
+# 修法：判"是不是真绳梯"时同时看**当前段**路线图（同列 ±1px、上下 3px 内有竖向色码）。
+
+def _fakeup_cmd(with_rope):
+    '''合成 40×40 段图：(20,19) 一个 right、(20,20) 一个 up（正好在角色这一行）；
+       with_rope=True 时在 (20,19)/(20,18) 追两个 up 像素 = 真绳梯的连续竖向。'''
+    b = new_bot(player_global=(20, 20))
+    b.color_code = {k: v for k, v in b.color_code.items()
+                    if k not in {(127, 127, 127), (255, 255, 127)}}
+    seg = np.zeros((40, 40, 3), np.uint8)
+    seg[20, 10:31] = (0, 0, 255)         # 角色这一行是一整条横向路线（最近的横向像素 = (19,20)、(21,20)）
+    #                                      ⚠️ 必须让这一行有跨度：否则引擎的"边缘保护"
+    #                                      （`_apply_edge_guard`）会判"人已到路线右边界"强制改向左，
+    #                                      观测不到伪灰闸自己给的方向。
+    seg[20, 20] = (127, 127, 127)        # y=20, x=20 → up（距离 0，与角色同一行）
+    if with_rope:
+        seg[19, 20] = (127, 127, 127)    # 同一列向上连续 ⇒ 真绳梯
+        seg[18, 20] = (127, 127, 127)
+    b.img_map = np.zeros((40, 40, 3), np.uint8)
+    b.img_routes = [seg]
+    b.img_route = seg
+    b.img_route_home = np.zeros((40, 40, 3), np.uint8)   # 回正线里这一列没有竖向像素
+    b._build_mainline_cache()
+    b.home_lines = []
+    return frame(b)
+
+_rope_cmd = _fakeup_cmd(True)
+_fake_cmd = _fakeup_cmd(False)
+check("★ 真绳梯（当前段图上同列有连续竖向像素）→ 发 up，不再被伪灰闸压成横向",
+      _rope_cmd[1], "up")
+check("对照：孤立灰（同列上下没有竖向延续）仍按伪灰处理 → 走横向",
+      (_fake_cmd[0], _fake_cmd[1]), ("right", "none"))
+print(f"       真绳梯 {_rope_cmd} ｜ 孤立灰 {_fake_cmd}")
+
 print("\n【7】覆盖模拟 simulate_coverage：L 形 15/15，只画竖线接不住")
 landing = [(x, PIT_Y) for x in range(PIT_X0, PIT_X1 + 1)]
 cov_l = simulate_coverage(comp, [(x, MAIN_Y) for x in range(MAIN_X0, MAIN_X1 + 1)],
@@ -1178,6 +1217,65 @@ try:
     check("★ band 宽度 ≥ 5px（角色一帧走好几像素也落得进去）", _width >= 5, True)
 except FileNotFoundError as e:
     print(f"       ⚠️ 跳过：真实资源不可读（{e}）")
+
+print("\n【26】③ 回正入口可达性闸（2026-10-14）：线太远就别进（进去也是当帧空转）")
+# 真机背景（MSBot_2026-10-14_16-51-02.log）：8 条 [回正·小结] 里 6 条是
+#   「超时/接不上退出 | 0.0s/0帧 | 一次都没走到起跳点 | 离回正线 22~80px | 离主线 0px」
+#   —— 入口放行、进去当帧「回正线接不上」退出 + 去武装，只剩 churn
+#   （[回正] 2.2→14.2 次/分、[路线失联] 0.9→3.4 次/分）。
+# 几何（对齐真机那一刻的口径差）：
+#   * 主线 y=170 穿过人站的位置 ⇒ `_main_dist()` = 0px（真机小结里"离主线 0px"）；
+#   * 当前段 `img_route` 是空图 ⇒ `get_nearest_color_code()` 一个像素都搜不到
+#     （等价于真机被 E1 过滤掉之后"本帧没有可用的路线像素"）⇒ 只可能走"老兜底"入口；
+#   * 插入点① 不会抢先：`_main_dist()`=0 时 `home_should_return(d_home, 0, 0)` 恒为 False
+#     （主线优先），所以下面唯一在判的就是被 ③ 加闸的那条路。
+
+def _gate_bot(player):
+    _m = make_mainline(y=170)
+    _h = blank()
+    for _x, _y in [(99, 170), (100, 169), (101, 168), (102, 167)]:
+        _h[_y, _x] = JUMP
+    _h[167, 102] = GOAL
+    _b = new_bot(player_global=player)
+    _b.img_routes = [_m]
+    _b.img_route_home = _h
+    _b.img_route = blank()                 # 本帧当前段一个路线像素都搜不到
+    _b._build_mainline_cache()
+    _b.home_lines = [{
+        "id": 1, "start": (99, 170), "goal": (102, 167), "span": 6, "has_jump": True,
+        "n_pts": 4, "far_pts": [], "cover_xs": (99, 99), "cover_span": 1,
+        "bbox": (99, 167, 102, 170),
+        "xs": np.asarray([99, 100, 101, 102], dtype=np.int32),
+        "ys": np.asarray([170, 169, 168, 167], dtype=np.int32),
+        "armed": True, "disarm_t": 0.0,
+    }]
+    return _b
+
+
+_bn = _gate_bot((99, 170))                 # 站在回正线端点 (99,170) 上
+check("③ 近线：最近回正线像素 0px", _bn._home_dist()[0], 0)
+check("③ 近线：离主线 0px（真机口径）", _bn._main_dist()[0], 0)
+check("③ 近线：主线优先 ⇒ 插入点① 不放行（先堵掉另一条入口）",
+      home_should_return(0, 0, 0), False)
+with capture_log(level=logging.INFO) as _msgs_n:
+    _bn.update_cmd_by_route()
+check("③ 近线：0px ≤ 救援半径 40 ⇒ 照常进回正", _bn.is_using_home_route, True)
+check("③ 近线：确实走的是「老兜底」那条路（留痕「走丢了」）",
+      any("走丢了" in m for m in _msgs_n), True)
+
+_bf = _gate_bot((40, 170))
+check("③ 远线：最近回正线像素 59px（> 救援半径 40）", _bf._home_dist()[0], 59)
+check("③ 远线：离主线 52px（比离回正线更近 ⇒ 插入点① 也不放行）",
+      _bf._main_dist()[0], 52)
+check("③ 远线：主线优先 ⇒ 插入点① 不放行", home_should_return(59, 52, 0), False)
+with capture_log(level=logging.INFO) as _msgs_f:
+    _bf.update_cmd_by_route()
+check("★ ③ 远线：**不进去**（加闸前这里会进、然后当帧『接不上』退出 + 去武装）",
+      _bf.is_using_home_route, False)
+check("★ ③ 远线：留痕说清「够不着 ⇒ 不进去」",
+      any("够不着" in m and "不进去" in m for m in _msgs_f), True)
+check("③ 远线：不进回正也要把指令清干净（不能留着上一帧的方向键）",
+      (_bf.cmd_move_x, _bf.cmd_move_y), ("none", "none"))
 
 print("\n" + "=" * 60)
 if FAIL:

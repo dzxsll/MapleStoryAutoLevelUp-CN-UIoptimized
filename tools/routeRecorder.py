@@ -596,6 +596,74 @@ class RouteRecorder():
         new[expand_top:expand_top + h, expand_left:expand_left + w] = img
         return new
 
+    def _sync_saved_route_canvases(self, expand_top, expand_bottom,
+                                   expand_left, expand_right):
+        '''画布扩容时，把**已经存盘**的路线图一起同步补边/平移（2026-10-14 加）。
+
+        为什么必须有这一步（真机事故 `minimaps/废铁2`）：
+          `save_route()` 存的是**保存那一刻**的画布大小，而底图会随小地图滚动
+          向右/下扩容 ⇒ 同一场录制里先存的几段天生比 map.png 窄（真机实测：
+          route1/2 = 137x268、route3 = 137x314、route4+ = 137x344）。引擎按
+          map.png 的坐标系走，窄图会被判「尺寸不一致」**直接跳过不加载** ——
+          症状是"头几段凭空消失 + 巡逻闭环从 0px 变 119px + 手绘面板 IndexError"，
+          而且**一个错都不报**（只有一句 [路线校验] 会被淹没）。
+
+        扩容那一刻才知道扩了多少（往左/上扩还要整体平移坐标），所以根治点在这里。
+          离线补救工具 `tools/route_pad_canvas.py` 只处理得了"只往右/下扩"；
+          这里用的就是 `expand_canvas()` 同一套变换，与 `self.img_route` 完全一致，
+          往左/上扩时的坐标平移也一并正确。
+
+        ⚠️ 补录回正线模式（--append-home）**不同步**：那种模式下 map.png 是已存在的
+           旧底图、这一趟不会被重写，一旦扩容就会让内存画布与磁盘 map.png 错位。
+           这种情况只报一句 WARNING 让问题可见 —— 宁可不写，也不要写出一套错坐标。
+
+        Returns:
+            bool: 有没有真的写过盘（自检用来断言"不扩容时一个字节都不写"）
+        '''
+        if not any((expand_top, expand_bottom, expand_left, expand_right)):
+            return False
+        if getattr(self, "append_home", False):
+            logger.warning(
+                "[录制] 画布扩容了，但本次是「只补录回正线」—— 磁盘上的 map.png "
+                "不会重写，为避免路线与底图错位，**已存盘的路线图没有同步补边**。"
+                "补录时请让角色待在已录范围内；已经错位的图用 "
+                "python -m tools.route_pad_canvas --map <图名> 体检/补救。")
+            return False
+        map_dir = resource_path(os.path.join("minimaps", self.args.new_map))
+        names = [f"route{i}.png" for i in range(1, int(getattr(self, "idx_routes", 0)) + 1)]
+        names.append("route_home.png")
+        done, failed = [], []
+        for name in names:
+            p = os.path.join(map_dir, name)
+            if not os.path.exists(p):
+                continue
+            try:
+                img = load_image(p)
+                if img is None:
+                    failed.append(f"{name}（读不出来）")
+                    continue
+                new = self.expand_canvas(img, expand_top, expand_bottom,
+                                         expand_left, expand_right)
+                if new is None or new.shape == img.shape:
+                    continue
+                if not imwrite_unicode(p, new):
+                    failed.append(f"{name}（写出失败）")
+                    continue
+                done.append(name)
+            except Exception as e:                                   # noqa: BLE001
+                failed.append(f"{name}（{e}）")
+        if done:
+            logger.info(
+                f"[录制] 画布扩容（左+{expand_left} 上+{expand_top} "
+                f"右+{expand_right} 下+{expand_bottom}）⇒ 已存盘的 {len(done)} 个"
+                f"路线图同步补边/平移：{', '.join(done)}")
+        if failed:
+            logger.warning(
+                f"[录制] 扩容后同步这些路线图失败：{', '.join(failed)}"
+                f" —— 它们还是旧尺寸，引擎会跳过不加载。补救："
+                f"python -m tools.route_pad_canvas --map {self.args.new_map}")
+        return bool(done)
+
     def ensure_img_map_capacity(self, x, y, h, w):
         '''
         Ensure that self.img_map is large enough to contain the region defined by (x, y, h, w).
@@ -624,7 +692,7 @@ class RouteRecorder():
         expand_right = max(0, expand_right)
         # If no expansion needed, return
         if expand_top == 0 and expand_bottom == 0 and expand_left == 0 and expand_right == 0:
-            return
+            return False
 
         # Create new canvas and paste old image
         self.img_map = self.expand_canvas(self.img_map, expand_top, expand_bottom,
@@ -643,6 +711,13 @@ class RouteRecorder():
                 self.loc_player_global_last[0] + expand_left,
                 self.loc_player_global_last[1] + expand_top
             )
+
+        # ★ 2026-10-14：**已经存盘**的 route{N}.png / route_home.png 必须一起同步。
+        #   不做这一步，先存的几段就永远停在旧画布尺寸上 —— 引擎按 map.png 的坐标系
+        #   走，会判「尺寸不一致」把它们**整段跳过**（真机事故：闭环从 0px 变 119px，
+        #   手绘面板还会 IndexError）。详见 _sync_saved_route_canvases 的说明。
+        return self._sync_saved_route_canvases(expand_top, expand_bottom,
+                                               expand_left, expand_right)
 
     def remove_color_code_pixels(self, img):
         """
@@ -968,6 +1043,29 @@ class RouteRecorder():
             k = "space"
         return k or "space"
 
+    def teleport_key(self):
+        '''录制器认的**瞬移键**（来自 config `key.teleport`；读不到 / 留空 ⇒ 回落 "e"）。
+
+        ⚠️★ 2026-10-14：这是 `jump_key` 的**同类 bug，当时只修了跳跃那一半**。
+           `action_from_keys` 里原来写死 `if "e" in kp:  # Teleport skill`，
+           于是 config `key.teleport: space` 的用户录制时按空格 ⇒ 一路落到末尾
+           返回 `("", False)`：**一个传送像素都不画，全程静默、不报错**
+           （和"跳跃键不是空格就一次跳都记不下来"是同一个病）。
+
+           而引擎侧本来是全支持的：config 里有 4 个 teleport 色码
+           （left / right / up / down teleport），`KeyBoardController.run()` 里
+           `elif self.cmd_action == "teleport": self._press(cfg["key"]["teleport"])`
+           —— 也就是"引擎会走、录不出来"，故障只落在用户身上。
+
+        回落口径与 jump_key 一致：**读不到 / 留空 ⇒ 回落老的写死值 "e"**
+        （保证没设过 `key.teleport` 的人行为完全不变）。
+        '''
+        try:
+            k = str((self.cfg or {}).get("key", {}).get("teleport") or "e").strip().lower()
+        except Exception:                                    # noqa: BLE001
+            k = "e"
+        return k or "e"
+
     def action_from_keys(self, key_press, jump_latched=False):
         '''把"当前按住的键"翻译成路线动作。抽成纯函数是为了**能自检**（见
         `tools/verify_recorder_action.py`）—— 按键判定写死键名这类 bug 全程静默，
@@ -996,7 +1094,11 @@ class RouteRecorder():
             # 边跳边按上（爬管子/绳子常见）：色码表里没有"上+跳"的组合，
             # 退成「原地跳」—— 跳起来后下一帧的 up 像素会接手往上爬。
             return "none none jump", True
-        if "e" in kp:                                        # Teleport skill
+        # Teleport skill —— 键名**必须**来自 config `key.teleport`（见 teleport_key）：
+        # 这里曾写死 "e"，把"瞬移键不是 e"的用户整条传送录制路径**静默吞掉**。
+        # ⚠️ 没有方向键时不画（返回空动作）：色码表里只有 left/right/up/down 四种
+        #    teleport，没有"原地传送"这一项 —— 硬画会画出引擎认不出的颜色。
+        if self.teleport_key() in kp:
             if "left" in kp:
                 return "left none teleport", True
             if "right" in kp:

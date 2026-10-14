@@ -226,11 +226,15 @@ def main():
     # ⚠️ `self.img_route_home[_up_y-d, _up_x]` 这个片段在文件里可能出现多次，
     #    必须定位到**「防地面伪灰」那一处**（它紧跟在 _up_y 赋值之后），
     #    否则 index() 会撞上别处、得出错误结论（本用例第一版就踩了这个）。
+    # ⚠️ 2026-10-14：守卫与下标之间新增了"看当前段竖向像素"的**十几行代码**
+    #    （见引擎里 2026-10-14 那段注释），原来固定 1200 字的窗口会把下标挤到
+    #    窗口之外 ⇒ 这项会假失败。改成"从锚点起在全文里找"（判据不变：
+    #    仍然是"前置判断必须出现在下标访问之前"），不再依赖固定字数。
     anchor = "_up_y = color_code_up_down[\"pixel\"][1]"
     if anchor in src:
-        seg = src[src.index(anchor):src.index(anchor) + 1200]
-        idx_guard = seg.find("_can_check_fake = self.img_route_home is not None")
-        idx_use = seg.find("self.img_route_home[_up_y-d, _up_x]")
+        _from = src.index(anchor)
+        idx_guard = src.find("_can_check_fake = self.img_route_home is not None", _from)
+        idx_use = src.find("self.img_route_home[_up_y-d, _up_x]", _from)
         check("防伪灰那一段里，前置判断在下标访问之前",
               idx_guard != -1 and idx_use != -1 and idx_guard < idx_use,
               f"guard@{idx_guard} use@{idx_use}")

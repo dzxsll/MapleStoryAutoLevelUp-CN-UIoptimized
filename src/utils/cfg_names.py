@@ -29,11 +29,21 @@ SECTION_CN = {
     "route_recoder": "路线录制器",
     "game_window": "游戏窗口",
     "system": "系统设置",
+    "demo_record": "手动示范录制（你自己玩，录成样本）",
 }
 
 # 通用字段名（所有分组共用）
 KEY_CN = {
     "enable": "启用",
+    # ── 手动示范录制（2026-10-14 加）────────────────────────────────────
+    "enabled": "启用录制（你自己玩，引擎只记不按）",
+    "record_only": "只记录不操作（键盘静音，必须为 true 才是干净样本）",
+    "out_dir": "落盘目录（JSONL，每帧一行）",
+    "record_keys": "记录真人按键（含按下/抬起时间戳）",
+    "every_n_frames": "每几帧记一条（1=每帧）",
+    "max_minutes": "单文件最长分钟数（到点换文件）",
+    "max_frames": "单文件最多帧数（0=只按分钟切）",
+    "gzip": "压缩落盘（.jsonl.gz）",
     "mode": "模式",
     "cooldown": "冷却时间（秒）",
     "offset": "坐标偏移",
@@ -48,13 +58,35 @@ KEY_CN = {
     "diff_thres": "匹配阈值",
     "global_diff_thres": "全局重搜阈值",
     "split_width": "标签切分宽度（像素）",
+    "relax_ratio": "抗闪：分数放宽倍数（1=关，半峰也采信以免丢位置）",
+    "relax_max_jump": "抗闪：放宽候选离上次严格命中的最大像素",
     "width": "宽度",
     "height": "高度",
     "search_box_margin": "搜索框外扩像素",
     "contour_blur": "轮廓模糊核大小",
+    "verify_color": "启用前景色校验（挡植被假框）",
+    "verify_color_tol": "前景色校验：单像素色差上限",
+    "verify_min_ratio": "前景色校验：达标像素占比下限",
+    "stop_to_attack": "巡逻中停下来打完再走",
+    "stop_attack_clear_frames": "判定「打完了」的空检测帧数",
+    "stop_attack_timeout_s": "停下打怪最长秒数（超时强制恢复巡逻）",
+    "target_hold_s": "目标锁定：连续几秒没再看见才算打完（0=关）",
+    "stop_attack_clear_s": "判定「打完了」的空窗秒数（与帧数判据取交集）",
+    "approach_confirm_s": "追怪：连续多久内两次看见才算真目标",
+    "approach_dir_min_s": "追怪方向最小保持秒数（治左右抖动）",
+    "engaged_scan": "交战时只扫攻击框（提速，松开即恢复全框）",
+    "detect_range_scale": "感知范围倍数（看得远；不影响攻击范围）",
+    "detect_range_scale_y": "感知范围倍数·竖直（收窄省时间）",
+    "approach_mob": "够不着就走过去打",
+    "approach_dy_tol": "「同一层」高度容差（px）",
+    "stale_pos_full_frame_after": "位置丢失多少帧后放宽到整帧（0=关）",
+    "miss_dump": "丢名字时存一张画面到 debug/（诊断用）",
     "with_enemy_hp_bar": "启用怪物血条检测",
     "hp_bar_color": "怪物血条颜色（BGR）",
     "max_mob_area_trigger": "判定为目标的最小重叠面积",
+    "mob_engage_mode": "够得着判据（默认 center=中心在框内 / min_area=交叠面积，老口径）",
+    "mob_engage_margin": "宽判定余量（px；判定时把攻击框向外各扩这么多，0=关掉）",
+    "detect_log": "写「[怪检测] 明细」行（诊断用；关掉不影响其它日志）",
     "ui_y_start": "界面区域起始 Y 坐标",
     "select_character": "选角色按钮坐标",
     "login_button_thres": "登录按钮匹配阈值",
@@ -85,7 +117,9 @@ SECTION_KEY_CN = {
     "nametag.offset": "标签左上角到角色中心的偏移",
     "minimap.offset": "小地图整体偏移",
     "monster_detect.mode": "检测模式",
+    "monster_detect.scales": "模板缩放比例（多尺度匹配）",
     "nametag.mode": "比对模式",
+    "nametag.pos_cache": "记住上次定位到的位置（按地图存盘）",
     "character.width": "角色宽度（像素）",
     "character.height": "角色高度（像素）",
 
@@ -105,6 +139,21 @@ SECTION_KEY_CN = {
     "route.home_rearm_margin": "去武装后重新武装：角色离开这条线多远才生效（像素）",
     "route.home_rearm_timeout": "去武装兜底时间（秒）：这么久后无条件重新武装",
     "route.home_reenter_lock": "回正失败后的冷静期（秒，期间不再重试回正、先打怪）",
+    # 2026-10-14（用户拍板 A）：梯上让路的"真在爬"窗口。
+    #   界面上不显示（与 route.ladder_leave_x 同口径：算法判据，改错会把爬梯搞坏），
+    #   但要有个中文名 —— 日志里那行会点名这个键，用户去 yaml 里能找到。
+    "route.ladder_still_s": "梯上让路：多久没有竖向移动就不再让路（秒；0=关掉本层，退回老行为）",
+    # 2026-10-14（用户拍板 D）：绳梯脚下"蹭一下"自救。
+    #   界面上不显示（同 ladder_leave_x / ladder_still_s 口径：算法判据），
+    #   但日志里那行会点名 rope_nudge_s，用户去 yaml 里能找到。
+    "route.rope_nudge_s": "绳梯脚下自救：按着上下多久没动就开始左右蹭（秒；0=关掉本层）",
+    "route.rope_nudge_ms": "绳梯脚下自救：每次蹭多少毫秒",
+    "route.rope_nudge_cycle_s": "绳梯脚下自救：两次蹭之间隔多少秒",
+    "route.rope_nudge_max_s": "绳梯脚下自救：蹭多久还没动就放弃（秒，之后退回老行为）",
+    # 2026-10-14（用户拍板 E1）：goal 像素不再吃掉整帧。
+    #   界面上不显示（同 ladder_leave_x / ladder_still_s / rope_nudge_s 口径：
+    #   算法判据），但日志里 `[路线·goal过滤]` 那行会点名它，去 yaml 里能找到。
+    "route.goal_pixel_skip": "goal 像素过滤（1=开：站在本段终点正下方时不再收到不会动的 `none none goal` 指令；0=关回老行为）",
 
     # ── route_recoder：v0.9 手绘回正线面板参数 ────────────────────────────
     "route_recoder.home_draw_scale": "手绘画布放大倍数",

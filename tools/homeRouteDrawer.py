@@ -54,7 +54,8 @@ from PySide6.QtWidgets import (
 
 from src.utils.logger import logger
 from src.utils.common import (
-    load_image, imwrite_unicode, mask_route_colors, load_yaml, override_cfg,
+    load_image, imwrite_unicode, mask_route_colors, route_size_mismatch,
+    load_yaml, override_cfg,
     active_config_path,
 )
 from src.utils.paths import resource_path
@@ -816,6 +817,8 @@ class HomeRouteDrawer(QDialog):
                            if f.startswith("route") and f.endswith(".png"))
         except OSError:
             names = []
+        # 尺寸与 map.png 不一致的主线图（另一次录制的遗留）在这里被挑出来
+        self.skipped_routes = []
         for f in names:
             if f in ("route_home.png", "route_rest.png"):
                 continue
@@ -824,6 +827,17 @@ class HomeRouteDrawer(QDialog):
                                    cv2.COLOR_BGR2RGB)
             except Exception as e:
                 logger.warning(f"[手绘回正线] 主线 {f} 读失败，跳过：{e}")
+                continue
+            # ⚠️ 必须与 map.png 同尺寸（同坐标系）。不跳过的话下面 _rebuild_base
+            #    会拿 268 宽的掩码去盖 344 宽的底图 →
+            #    IndexError: boolean index did not match ... 344 but ... 268
+            #    （2026-10-14 真机：用户的地图目录里混着两次录制的文件）。
+            if route_size_mismatch(img.shape, self.img_map_bgr.shape):
+                self.skipped_routes.append((f, img.shape[:2]))
+                logger.warning(
+                    f"[手绘回正线] 主线 {f} 尺寸 {img.shape[:2]} 与 map.png "
+                    f"{self.img_map_bgr.shape[:2]} 不一致 ⇒ 已跳过不显示"
+                    f"（另一次录制的，坐标系不同，画上去会错位）。")
                 continue
             self.route_imgs_rgb.append(mask_route_all(self.img_map_bgr, img, self.cfg))
         self.main_pts = []
@@ -837,6 +851,24 @@ class HomeRouteDrawer(QDialog):
         self.main_move_pts = []
         for img in self.route_imgs_rgb:
             self.main_move_pts.extend(_iter_code_pixels(img, _move_codes))
+
+        # 有尺寸不一致的主线图 ⇒ 明确告诉用户（否则"少画了几条线"看着像 bug）
+        if self.skipped_routes:
+            _lines = "\n".join(f"  {n} —— {h} x {w}"
+                              for n, (h, w) in self.skipped_routes)
+            logger.error(
+                f"[手绘回正线] minimaps/{self.map_name} 里有 "
+                f"{len(self.skipped_routes)} 张主线图与 map.png "
+                f"{self.h}x{self.w} 尺寸不一致，已跳过不显示：{_lines}")
+            QMessageBox.warning(
+                self, "有主线图尺寸不一致（已跳过）",
+                f"下面这些主线图的尺寸和 map.png（{self.w} x {self.h}）不一样：\n\n"
+                f"{_lines}\n\n"
+                f"它们多半是**另一次录制**留下的 —— 那时小地图窗口大小不同，"
+                f"坐标系就不一样，画在这张地图上会错位，所以这次没显示。\n\n"
+                f"引擎也不该按它们走（会走到错的地方），建议删掉这几张，"
+                f"或按现在的小地图尺寸重录。")
+            QApplication.processEvents()
 
         # 已有回正线（**原始**内容，不 mask —— 那是"写盘真源"）
         if os.path.exists(self.path_home):
@@ -881,6 +913,12 @@ class HomeRouteDrawer(QDialog):
         '''合成底图（原尺寸 RGB）：地图 + 主线（半透明）+ 已存回正线（不透明）。'''
         base = cv2.cvtColor(self.img_map_bgr, cv2.COLOR_BGR2RGB).astype(np.int16)
         for img in self.route_imgs_rgb:
+            if route_size_mismatch(img.shape, base.shape):
+                # 兜底：_load_map 已经跳过尺寸不一致的主线图，这里再挡一次 ——
+                # 掩码与底图尺寸不同会抛 IndexError，而"手绘面板打不开"
+                # 比"少画几条参考线"严重得多（2026-10-14 真机）。
+                logger.warning("[手绘回正线] 跳过一张尺寸不一致的主线图（不该发生）")
+                continue
             mask = _color_mask(img, self.route_codes)
             if mask.any():
                 base[mask] = (base[mask] * 45 + img[mask].astype(np.int16) * 55) // 100

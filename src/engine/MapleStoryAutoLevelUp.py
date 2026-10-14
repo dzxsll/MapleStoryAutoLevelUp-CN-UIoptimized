@@ -15,6 +15,7 @@ import threading
 import shutil
 import tempfile
 import traceback
+import json
 
 # Library import
 import numpy as np
@@ -26,15 +27,23 @@ from src.utils.logger import (
     logger, jump_trace_on, perf_trace_on, perf_summary_line)
 from src.utils.paths import resource_path, ensure_dir
 from src.utils.common import (find_pattern_sqdiff, draw_rectangle, screenshot, nms,
-    load_image, get_mask, get_minimap_loc_size, get_player_location_on_minimap,
+    load_image, get_mask, flatten_alpha_to_green, imwrite_unicode,
+    get_minimap_loc_size, get_player_location_on_minimap,
     override_cfg, load_yaml,
-    click_in_game_window, mask_route_colors,
+    click_in_game_window, mask_route_colors, route_size_mismatch,
     activate_game_window, normalize_pixel_coordinate,
     get_window_client_size, crop_frame_to_client, put_text_cn,
     resolve_title_bar_height,
     monster_detect_interval, edge_guard_step_cap,
+    nametag_relax_decision,
+    mob_no_attack_reason,
+    monster_detect_snapshot,
     route_too_narrow_for_patrol,
 )
+# ── 手动示范录制（2026-10-14 加）：逐帧落盘 + 录真人按键 + 影子决策 ──────────
+# 见 src/utils/demo_recorder.py 的文件头（用户 m07008 提的路子：他自己玩，
+# 拿"人在同样画面上怎么做"当参照物，反推引擎的判据/阈值该松还是该紧）。
+from src.utils.demo_recorder import DemoRecorder, demo_settings
 from src.input.KeyBoardController import KeyBoardController, press_key
 from src.input.KeyBoardListener import KeyBoardListener
 from src.input.GameWindowCapturor import GameWindowCapturor
@@ -95,6 +104,22 @@ class MapleStoryAutoBot:
         self.is_first_frame = True # first frame flag
         self.is_terminated = False # Close all object and thread if True
         self.is_on_ladder = False # Character is on ladder or not
+        # ── 「真的在爬」的竖向进展戳（2026-10-14 加，用户拍板 A）──────────────
+        # 为什么：`is_on_ladder` **只进不出**（清除的两条出口都要横向移动），
+        #   怪逻辑的绳/梯让路被粘滞旗标一路吃掉 —— 示范录制实测梯上帧占 43.9%，
+        #   其中 44/105 段整段全局 y 零变化（人在这些帧里出手 910 次）。
+        #   ⇒ 让路判据改成「旗标为真 **且** 最近 route.ladder_still_s 秒内有竖向进展」。
+        # 怎么喂：跟踪块里唯一写入点，只认**小地图全局 y 变化**（零误报，见那里注释）。
+        self.t_ladder_move = 0.0     # 最近一次"小地图全局 y 变了"的时刻
+        self._ladder_gy = None       # 上一帧的小地图全局 y（判竖向进展）
+        self.t_ladder_stale_log = 0.0 # 「旗标粘着、不再让路」那行日志的 5s 节流戳
+        # ── 绳梯脚下"蹭一下"自救（2026-10-14 加，用户拍板 D）──────────────────
+        # 见 config/config_default.yaml 的 route.rope_nudge_* 长注释与 `_rope_nudge_dir()`。
+        # 为什么要有：角色停在绳子上时引擎只发纯 up，而"挪进绳子"的横向补位
+        #   只在 is_on_ladder 为真时才加 ⇒ 不动就永远不动（真机 45~50s 僵持）。
+        # 这里只存日志节流戳与一个纯观测计数（判据全在 `_rope_nudge_dir()`）。
+        self.t_rope_nudge_log = 0.0   # 「绳梯自救」那行日志的 1.5s 节流戳
+        self._rope_nudge_n = 0        # 本次开跑累计蹭过的帧数（纯观测）
         self.is_show_debug_window = not args.disable_viz #
         self.is_need_show_debug_window = not args.disable_viz #
         self.is_disable_control = args.disable_control
@@ -113,6 +138,50 @@ class MapleStoryAutoBot:
         #   命中过再失败 → 无害（同图内角色屏幕位置几乎是死的，沿用上次结果即可）
         #   一次都没命中 → 严重（位置停在初始值，攻击框跑到画面左上角，且不报错）
         self.nametag_ever_hit = False
+        # 「上次命中的名字锚点」按地图存盘（2026-10-14 加，见 _load_nametag_pos /
+        # _save_nametag_pos）。为什么需要：名字认不到时引擎沿用**上一帧**的锚点
+        # （位置被冻住），可"开局那几帧"没有上一帧 ⇒ 位置停在 (0,0)，
+        # 攻击框落到画面左上角 = 只走不打且不报错。
+        self.loc_nametag_from_cache = False   # 开局的 loc_nametag 是否来自存盘文件
+        self.t_nametag_save = 0.0             # 上次写盘时间（节流用）
+        self.nametag_pos_save_failed = False  # 写盘失败只吼一次（fail-open）
+        # ── 丢名字存画面（2026-10-14 加，诊断用，见 _dump_nametag_miss）────────
+        self.t_nt_miss_dump = 0.0             # 上次存图时间（5 秒节流用）
+        self.nt_miss_dump_failed = False      # 存图失败只吼一次（fail-open）
+        # ── 名字定位「抗闪」（2026-10-14 加，判据见 src/utils/common.py 的
+        #    nametag_relax_decision）────────────────────────────────────────
+        # 分数落在"半峰"（认不出但又远没到完全失配）时，只要位置不跳就采信这一帧，
+        # 目的是**别让 miss 计数涨过 stale_pos_full_frame_after**（涨过之后索敌框
+        # 放大到整帧 ⇒ 怪数虚高 + 去追画面外的目标，真机日志实证）。
+        self._nt_strict_pos = None     # 上次**严格命中**算出的角色位置（放宽判据的锚点）
+        self.nametag_relaxed = False   # 本帧是不是"放宽采信"（观测用）
+        self.nametag_relax_hits = 0
+        # 「没出招·归因」日志的节流时间戳（2026-10-14）。读的时候一律 getattr 兜底：
+        # 离线自检的 Stub 不走 __init__（见 _mob_no_attack_log）。
+        self.t_mob_noatk_log = 0.0    # 「没出招·归因」的节流时间戳
+        # 手动示范录制（2026-10-14 加）：`demo_record.enabled: true` 时在 start()
+        # 里换成 DemoRecorder 实例，否则恒为 None（`record_demo_frame` 直接返回）。
+        self.demo = None
+        # [怪检测] 明细行（2026-10-14 加，纯观测）：用户 m06852「记录下怪物的检测
+        #   信息，现在的攻击还是不够灵敏」—— 只写「怪N」看不出它在哪、为什么不算
+        #   够得着。这里记节流时间戳、上一帧"框内集合"的指纹、以及**第一只怪进框**
+        #   的时刻（出招时用它算"进框→首刀"的毫秒数 = 灵敏度）。
+        #   一律 getattr 兜底（离线自检的 Stub 不走 __init__）。
+        self.t_detect_log = 0.0       # [怪检测] 的节流时间戳
+        self._det_log_sig = None      # 上一帧攻击框内那批怪的指纹（变了就立刻打）
+        self._det_log_failed = False  # 明细行生成失败只吼一次
+        self._eng_first_t = None      # 第一只怪进攻击框的时刻（灵敏度基准）
+        # [出招] 心跳（2026-10-14 加，纯观测）：用户反馈「攻击就是很慢 / 怪在攻击
+        #   范围内了就是不攻击」—— 把「真的出招了几次 / 间隔多少 / 出招时框内几只怪」
+        #   摊在日志里，一眼分清是 (a) 引擎不出招（框内没怪 / 冷却未到）还是
+        #   (b) 出了招但游戏没反应。一律 getattr 兜底（离线自检的 Stub 不走 __init__）。
+        self._atk_n = 0               # 本窗口出招次数
+        self._atk_gap_n = 0           # 有效间隔样本数（第一次出招没有"上一次"）
+        self._atk_gap_sum = 0.0
+        self._atk_gap_min = None
+        self._atk_gap_max = 0.0
+        self._atk_eng_min = None      # 出招时攻击框内的怪数（区间）
+        self._atk_eng_max = 0
         self.loc_player_minimap = (0, 0) # player location on minimap
         self.loc_minimap_global = (0, 0) # minimap location on global map
         self.loc_player_global = (0, 0) # player location on global map
@@ -678,6 +747,43 @@ class MapleStoryAutoBot:
         logger.debug(f"[路线校验] {name}：{n} 个路线像素，跨度 {span}px，有 goal ✓")
         return True, ""
 
+    def _clamp_route_index(self):
+        '''
+        把「当前巡逻段号」钳回合法范围（2026-10-12 加、2026-10-14 重新接回）。
+
+        ## 为什么需要它（真机**两次**停摆，症状都是"角色不动 + 一屏 IndexError"）
+
+        界面按【开始】会在**同一个进程里**重跑 `load_config(cfg)`
+        （`src/ui/AutoBotController.py:109`），那次调用会重建 `img_routes`：
+
+        * 用户把一张图**从 10 段重录成 2 段** ⇒ 列表从 10 条变 2 条，
+          而 `idx_routes` 还停在上一轮的值（比如 8）⇒
+          `self.img_routes[self.idx_routes]` → IndexError；
+        * 崩溃点排在「路线推进」之前 ⇒ 段号永远回不来 ⇒ 主循环**每帧都炸**
+          （实测日志：「累计失败 149 帧」与「累计失败 296 帧」两次）；
+        * 列表非空 ⇒ `run_once` 里那道 `and self.img_routes` 守卫会放它过去 ——
+          所以"列表空不空"这个守卫**挡不住**这个坑。
+
+        所以每次重建列表之后都要钳一次。
+        **合法的段号不许被动**：否则每次重载都会把巡逻打断回第一段
+        （`tools/verify_route_index_bounds.py` 钉的就是这两面）。
+        '''
+        if not isinstance(getattr(self, "idx_routes", None), int):
+            self.idx_routes = 0
+            return self.idx_routes
+        n = len(getattr(self, "img_routes", None) or [])
+        if self.idx_routes < 0 or self.idx_routes >= n:
+            _old = self.idx_routes
+            self.idx_routes = 0
+            # ⚠️ 只在**真的改了值**时出声：`n == 0 且 idx == 0`（这张图还没录路线）
+            #    本来就没问题，报一条"段号 0 超出范围（当前 0 段）"只会制造噪音。
+            if _old != 0:
+                logger.warning(
+                    f"[路线] 段号 {_old} 超出范围（当前 {n} 段），已回到第 1 段。\n"
+                    f"        换图 / 重录成更少段 / 有段被判废时都会发生；不钳位则主循环每帧 "
+                    f"IndexError（角色彻底不动）。")
+        return self.idx_routes
+
     def load_config(self, cfg):
         '''
         load_config
@@ -757,7 +863,10 @@ class MapleStoryAutoBot:
             if not map_name:
                 logger.info("地图未选择，跳过地图加载")
                 return
-            if map_name not in self.data["map_mobs_mapping"]:
+            # ⚠️ 2026-10-13：登记表是**裸头部**时 yaml 解析成 None（见 utils/registry.py
+            #    的 _drop_line_in_block 事故），原来直接下标会抛 KeyError；
+            #    `or {}` 兜底，只影响这一处的报错文案，不改变正常路径。
+            if map_name not in (self.data.get("map_mobs_mapping") or {}):
                 text = f"Invalid map name: {map_name}. "\
                         "Not supported in config/config_data.yaml."
                 logger.error(text)
@@ -775,8 +884,26 @@ class MapleStoryAutoBot:
                            if not p.endswith("route_rest.png")
                            and not p.endswith("route_home.png")]
             self.img_routes = []
+            _map_hw = self.img_map.shape[:2]
             for route_file in route_files:
                 img = cv2.cvtColor(load_image(route_file), cv2.COLOR_BGR2RGB)
+                # ── 尺寸一致性闸（2026-10-14 加，与废线一样跳过）────────────────
+                # 路线图的坐标系 = map.png 的坐标系（录制器拿 map.png 当全景图，
+                # 由 find_pattern_sqdiff 定出小地图位置后把角色点画上去的）。
+                # 尺寸不一样 ⇒ **刻度不一样**：引擎按它走会走到错的地方、或者
+                # 在 get_nearest_color_code 里扫不到任何色码（站着不动），两者都不报错。
+                # 真机现场：minimaps/废弃地铁2 里 map.png 137x344、route3..7 也是
+                # 137x344，但 route1 137x268、route2 137x319（另一次录制的遗留）——
+                # 手绘回正线面板就是被这两个撞崩的（boolean index 344 vs 268）。
+                if route_size_mismatch(img.shape, _map_hw):
+                    logger.error(
+                        f"[路线校验] minimaps/{map_name}/{os.path.basename(route_file)} "
+                        f"尺寸 {img.shape[:2]} 与 map.png {_map_hw} 不一致，"
+                        f"已跳过不加载。\n"
+                        f"        它是**另一次录制**留下的（那时小地图窗口大小不同 ⇒ "
+                        f"坐标系不一样），按它走会走到错的地方。\n"
+                        f"        修法：删掉这一张，或按现在的小地图尺寸重录这一段。")
+                    continue
                 # Remove pixel in map that is color code
                 img = mask_route_colors(self.img_map, img, cfg["route"]["color_code"])
                 img = mask_route_colors(self.img_map, img, cfg["route"]["color_code_up_down"])
@@ -791,6 +918,11 @@ class MapleStoryAutoBot:
                         f"一路走到终点再按 F3 保存（收尾会自动盖上 goal 标记）。")
                     continue
                 self.img_routes.append(img)
+
+            # ── 段号钳位（2026-10-14 重新接回）───────────────────────────────
+            # 列表刚重建完，段数可能与上一轮不同（换图 / 重录成更少段 / 有段被判废）：
+            # 不钳位就会在 run_once 里按下标取 route 时 IndexError，**且每帧都炸**。
+            self._clamp_route_index()
 
             # ── 移动指令自检（2026-09-14 加）──────────────────────────────────
             # 录制器定位失败（坐标卡 0,0）时会录出「整段全是 goal、一个 left/right
@@ -917,19 +1049,56 @@ class MapleStoryAutoBot:
                     d for d in os.listdir(monster_root)
                     if os.path.isdir(os.path.join(monster_root, d)))
             else:
-                mob_names = list(self.data["map_mobs_mapping"][map_name])
+                # ⚠️ 2026-10-13：同上，`or {}` + `.get(...) or []` 兜底；缺登记者退化成
+                #    空列表，随后会被下面「没有可用怪模板」的报错分支接住，不会静默。
+                mob_names = list(
+                    (self.data.get("map_mobs_mapping") or {}).get(map_name) or [])
 
+            # 🔍 多尺度模板（2026-10-13 借参考项目 zhoufanglu/maplestory-auto-ds）：
+            #    scales 默认 [1.0] ⇒ 与"没有这个键"逐像素一致（**不做任何 resize**）。
+            #    官方素材/换分辨率导致模板尺寸对不上时，配 [0.7, 0.85, 1.0, 1.15] 之类。
+            #    代价 ≈ 匹配次数 × 尺度数（每张模板本来就有"原图 + 左右镜像" = ×2）。
+            _mob_scales_list = self._mob_scales(cfg.get("monster_detect"))
+            _mob_tpl_total = 0
             for monster_name in mob_names:
                 imgs = []
+                _no_bg = []      # 没有绿幕也没有透明底的模板（整张矩形都会参与匹配）
                 for file in glob.glob(resource_path(f"monster/{monster_name}/{monster_name}*.png")):
-                    # Add original image
-                    img = load_image(file)
-                    imgs.append((img, get_mask(img, (0, 255, 0))))
-                    # Add flipped image
-                    img_flip = cv2.flip(img, 1)
-                    imgs.append((img_flip, get_mask(img_flip, (0, 255, 0))))
+                    try:
+                        # ⚠️ IMREAD_UNCHANGED（2026-10-13）：官方素材常是 RGBA 透明底，
+                        #    用默认的 IMREAD_COLOR 读会**直接丢掉 alpha**、透明区变成黑块
+                        #    —— contour_only 模式下整块黑背景会被当成轮廓（假轮廓）。
+                        #    flatten_alpha_to_green 把透明区填成绿幕，与 get_mask 的口径一致。
+                        raw = load_image(file, cv2.IMREAD_UNCHANGED)
+                        img = flatten_alpha_to_green(raw)
+                    except Exception as e:                       # noqa: BLE001
+                        # 单张读不了就跳过这一张（不静默：ERROR + 文件名 + 原因）
+                        logger.error(f"[怪物] 模板 {file} 读取失败，已跳过这一张：{e!r}")
+                        continue
+                    if bool(get_mask(img, (0, 255, 0)).all()):
+                        _no_bg.append(os.path.basename(file))
+                    if min(img.shape[0], img.shape[1]) < 10:
+                        # 匹配阶段对 <10px 的模板是**跳过**（判据借参考项目，见
+                        # get_monsters_in_range）。这里在**加载时**吼一次，
+                        # 而不是每帧每张都打一条 —— 否则日志会被刷屏。
+                        logger.warning(
+                            f"[怪物] 模板 {os.path.basename(file)} 只有 "
+                            f"{img.shape[1]}x{img.shape[0]}（边长 <10px），"
+                            f"匹配时会跳过这一张。\n"
+                            f"        怎么修：重截一张更大的（怪在画面里多大就截多大）；"
+                            f"或用官方的透明底素材（现已支持 RGBA）。")
+                    imgs.extend(self._mob_template_variants(img, _mob_scales_list))
+                if _no_bg:
+                    logger.warning(
+                        f"[怪物] monster/{monster_name}/ 里这些模板没有绿幕、也没有透明底："
+                        f"{', '.join(_no_bg)}\n"
+                        f"        它们会整张矩形参与匹配 —— contour_only 模式下模板里的"
+                        f"黑色背景会被当成轮廓，容易误报。\n"
+                        f"        怎么修：用 RGBA 透明底 PNG（现已支持），"
+                        f"或把背景涂成纯绿 RGB(0,255,0) 再截图。")
                 if imgs:
                     self.monsters_info[monster_name] = imgs
+                    _mob_tpl_total += len(imgs)
                 elif match_all:
                     # 全量扫描会扫到空目录之类的东西 —— 跳过就行，不能因此拒绝启动
                     logger.debug(f"[怪物] monster/{monster_name}/ 下没有 "
@@ -961,7 +1130,9 @@ class MapleStoryAutoBot:
                         f"（加载全部模板，不用逐图登记）。")
             else:
                 logger.info(f"Loaded monsters: {list(self.monsters_info.keys())}"
-                            f"（{'全部模板' if match_all else f'按图过滤：{map_name}'}）")
+                            f"（{'全部模板' if match_all else f'按图过滤：{map_name}'}；"
+                            f"{_mob_tpl_total} 个模板 = 每张 PNG × 左右镜像 × "
+                            f"scales{_mob_scales_list}）")
                 if len(self.monsters_info) > 8:
                     logger.warning(
                         f"[怪物] 当前每帧要匹配 {len(self.monsters_info)} 种怪的模板 —— "
@@ -999,6 +1170,12 @@ class MapleStoryAutoBot:
                 f"或在 config 里把 nametag.name 改成实际文件名（不含 .png 后缀）。"
             )
             raise
+
+        # 开局先用「上次保存的名字锚点」兜底（2026-10-14 加）——
+        # 名字偶尔认不到是常态，而**开局那几帧**没有"上一帧"可用，
+        # 位置会停在 (0,0)（攻击框跑到画面左上角，只走不打且不报错）。
+        # 详见 _load_nametag_pos()；只读 json，不改识别逻辑。
+        self._load_nametag_pos(w_match=self.img_nametag.shape[1])
 
         # Load misc image
         # 国服适配（2026-09-12）：登录按钮图只用于「掉线自动重登」兜底（小地图
@@ -1070,6 +1247,26 @@ class MapleStoryAutoBot:
         #    详见 KeyBoardController.is_game_window_active 的说明。
         self.kb.game_hwnd = getattr(self.capture, "window_hwnd", None)
         logger.info(f"[前台守卫] 游戏窗口句柄 = {self.kb.game_hwnd}")
+
+        # ── 手动示范录制（2026-10-14 加）────────────────────────────────
+        # `demo_record.enabled: true` ⇒ 逐帧落盘（感知 + 影子决策 + 真人按键）；
+        # `record_only: true` ⇒ 顺便把键盘**静音**（KeyBoardController 的发送循环
+        # 见 is_enable 就跳过，感知/决策照跑）⇒「你自己操作、引擎只算不按」。
+        # 见 src/utils/demo_recorder.py 文件头与 tools/analyze_demo.py。
+        self.demo = None
+        try:
+            _demo = DemoRecorder(self.cfg, logger=logger)
+            if _demo.settings.get("enabled"):
+                if _demo.settings.get("record_only") and not self.is_disable_control:
+                    self.kb.disable()
+                    logger.warning(
+                        "[示范录制] record_only=true ⇒ **键盘已静音**：引擎一个键都不发，"
+                        "请你自己操作（想边看边打就把 demo_record.record_only 改成 false）")
+                if _demo.start():
+                    self.demo = _demo
+        except Exception as _e:                               # noqa: BLE001
+            self.demo = None
+            logger.warning(f"[示范录制] 初始化失败：{_e!r} —— 不影响挂机")
 
         # Reset all timers
         self.t_last_frame = time.time()
@@ -1154,6 +1351,334 @@ class MapleStoryAutoBot:
                 logger.error(f"[stop_record] 搬移视频失败: {e}")
                 logger.error(f"           临时文件仍在: {self.video_tmp_path}")
         logger.info("[stop_record] Stop recording")
+
+    def _nametag_pos_path(self):
+        '''名字锚点存盘路径：minimaps/<当前地图>/nametag_pos.json（拿不到地图名 → None）。
+
+        放地图目录里（与 route*.png / route_home.png 同级）的理由：
+          · 换地图天然分开，不用维护一张"图名 → 坐标"的对照表；
+          · 出问题只删这一个文件就回到旧行为，回滚点明确、可指认。
+        '''
+        try:
+            _map = self.cfg["bot"]["map"]
+        except (KeyError, TypeError):
+            return None
+        if not _map:
+            return None
+        return resource_path(f"minimaps/{_map}/nametag_pos.json")
+
+    def _load_nametag_pos(self, w_match=None):
+        '''开局读回「上次名字定位命中」的锚点；用上了返回 True（2026-10-14 加）。
+
+        为什么需要：名字认不到时引擎沿用**上一帧**的 loc_nametag（位置被冻住），
+        这本来无害 —— 同一张图里角色屏幕位置几乎是死的。但**开局那几帧**没有
+        "上一帧"可用 ⇒ 位置停在初始值 (0,0)，攻击框落到画面左上角，
+        症状是"只走路、不打怪"而且**不报错**。人堆遮挡导致名字偶尔丢是常态，
+        所以把每张图最后一次命中的锚点存下来，开局先用着。
+
+        存的是 `loc_nametag`（匹配到的锚点原始坐标），**不是** `loc_player`：
+        引擎每帧都用 `loc_nametag + 当前模板宽度/offset` 反算 loc_player，
+        存原始锚点才能与当前模板/offset 自洽（换模板后不会错位一个模板宽）。
+
+        fail-closed：文件缺失 / 读不动 / 字段不全 / 坐标不合理 ⇒ 一律当"没存过"，
+        不猜、不放行；合理性判据直接复用画面外假命中护栏 `_nametag_pos_plausible`。
+        '''
+        if not bool(self.cfg["nametag"].get("pos_cache", True)):
+            return False
+        path = self._nametag_pos_path()
+        if not path or not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r", encoding="utf-8") as fp:
+                data = json.load(fp)
+            x = int(data["loc_nametag"][0])
+            y = int(data["loc_nametag"][1])
+        except (OSError, ValueError, TypeError, KeyError, IndexError) as e:
+            logger.warning(
+                f"[名字定位] {path} 读不出来（{e!r}）⇒ 按「没存过位置」处理"
+                f"（删掉这个文件即可清掉这条记录）。")
+            return False
+        ok, cand = self._nametag_pos_plausible((x, y), w_match)
+        if not ok:
+            logger.warning(
+                f"[名字定位] 存盘的位置 ({x}, {y}) 算出来是 {cand}（在画面外）⇒ 不采用。"
+                f"删掉 {path} 可清掉这条记录，下次命中会重新写一份。")
+            return False
+        self.loc_nametag = (x, y)
+        self.loc_nametag_from_cache = True
+        # 存盘锚点是**严格命中**时写下的 ⇒ 可以直接当"抗闪"判据的锚点：这样开局
+        # 头几帧的半峰候选也能采信（那几帧正好最需要，见 nametag_relax_decision）。
+        self._nt_strict_pos = (int(cand[0]), int(cand[1]))
+        logger.info(
+            f"[名字定位] 开局先用**上次保存的位置**：锚点 ({x}, {y}) → 角色 {cand}"
+            f"（来自 {path}）。\n"
+            f"        名字认不到时先按这个位置出招；一旦认出真名字会立刻改用它。"
+            f"换过角色 / 改过名字 / 搬过游戏窗口的话，请删掉该文件。")
+        return True
+
+    def _save_nametag_pos(self, w_match, score=None, force=False, min_interval=5.0):
+        '''把这次命中的锚点按地图存盘（节流：默认 5 秒最多写一次；force 立刻写）。
+
+        fail-open：写盘只是"下次开局更好看"的加速器，**不是功能本身** ——
+        失败绝不许影响挂机，留一条 WARNING（只吼一次、不刷屏）即可。
+        写盘走"临时文件 + os.replace"，避免写一半崩掉留下半截 json。
+        '''
+        if not bool(self.cfg["nametag"].get("pos_cache", True)):
+            return False
+        path = self._nametag_pos_path()
+        if not path:
+            return False
+        now = time.time()
+        if not force and (now - float(getattr(self, "t_nametag_save", 0.0) or 0.0)) < min_interval:
+            return False
+        try:
+            _off = int(self.cfg["nametag"]["offset"][1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            _off = 0
+        try:
+            _w = int(w_match)
+        except (TypeError, ValueError):
+            _w = 0
+        data = {
+            "note": "角色名标签最后一次命中的屏幕锚点。开局若认不到名字，引擎先用它出招；"
+                    "删掉本文件即可回到旧行为（位置停在初始值）。",
+            "map": self.cfg["bot"].get("map"),
+            "loc_nametag": [int(self.loc_nametag[0]), int(self.loc_nametag[1])],
+            "loc_player": [int(self.loc_nametag[0]) + _w // 2, int(self.loc_nametag[1]) - _off],
+            "score": None if score is None else round(float(score), 4),
+            "saved_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        tmp = path + ".tmp"
+        try:
+            ensure_dir(os.path.dirname(path))
+            with open(tmp, "w", encoding="utf-8") as fp:
+                json.dump(data, fp, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except OSError as e:
+            if not getattr(self, "nametag_pos_save_failed", False):
+                self.nametag_pos_save_failed = True
+                logger.warning(
+                    f"[名字定位] 位置存盘失败（{path}）：{e!r} —— 不影响挂机，"
+                    f"只是下次开局不能先用上次的位置。")
+            return False
+        self.nametag_pos_save_failed = False
+        self.t_nametag_save = now
+        # 已经有真命中了 ⇒ 不再是"开局用存盘位置"状态（告警文案据此分流）
+        self.loc_nametag_from_cache = False
+        return True
+
+    # ── 手动示范录制（2026-10-14 加）────────────────────────────────────
+    def _demo_frame_facts(self):
+        '''拼出本帧要落盘的**事实**（引擎感知 + 影子决策；按键由录制器补）。
+
+        ⚠️ 纯观测：只读引擎状态，一个字段都不改。
+        ⚠️ 怪的中心按 `(position, size)` 现有约定算，且 `size` 是 **(宽, 高)**
+           （2026-10-14 修掉了构造点的 `(h, w)` 对调）。
+        '''
+        try:
+            _eng_ids = {id(_m) for _m in self._mobs_in_attack_box()}
+        except Exception:                                     # noqa: BLE001
+            _eng_ids = set()
+        _mobs = []
+        for _m in (getattr(self, "monsters", None) or []):
+            try:
+                _px, _py = _m["position"]
+                _mw, _mh = _m["size"]
+                _mobs.append({
+                    "cx": int(_px + _mw // 2), "cy": int(_py + _mh // 2),
+                    "w": int(_mw), "h": int(_mh),
+                    "s": float(_m.get("score") or 0.0),
+                    "in": 1 if id(_m) in _eng_ids else 0,
+                })
+            except Exception:                                 # noqa: BLE001
+                continue
+        _box = _sb = None
+        try:
+            _box = [int(_v) for _v in self.get_attack_range()]
+        except Exception:                                     # noqa: BLE001
+            pass
+        try:
+            _sb = [int(_v) for _v in self.get_search_box()]
+        except Exception:                                     # noqa: BLE001
+            pass
+        return {
+            "t": time.time(),
+            "frame": int(getattr(self, "n_frame", 0) or 0),
+            "player": getattr(self, "loc_player", None),
+            "nametag": getattr(self, "loc_nametag", None),
+            "miss": int(getattr(self, "nametag_miss_streak", 0) or 0),
+            "ladder": bool(getattr(self, "is_on_ladder", False)),
+            "seg": getattr(self, "idx_routes", None),
+            "minimap": getattr(self, "loc_player_minimap", None),
+            "global": getattr(self, "loc_player_global", None),
+            "attack_box": _box,
+            "search_box": _sb,
+            "mobs": _mobs,
+            "bot": {
+                "mx": getattr(self, "cmd_move_x", "none"),
+                "my": getattr(self, "cmd_move_y", "none"),
+                "act": getattr(self, "cmd_action", "none"),
+                "t_atk": float(getattr(self, "t_last_attack", 0.0) or 0.0),
+            },
+        }
+
+    def record_demo_frame(self):
+        '''手动示范录制：本帧落一行（`hunting.on_frame` 末尾调，纯观测）。
+
+        位置讲究：必须在 `kb.set_command(...)` **之后** —— 那时 `cmd_*` 已是
+        本帧最终决策（路线 → 打怪 → 卡死处理都跑完了），录到的影子决策才是
+        "引擎本来会怎么做"。没开录制（`self.demo is None`）时这里几乎零成本。
+        '''
+        _d = getattr(self, "demo", None)
+        if _d is None:
+            return
+        try:
+            _d.add_frame(self._demo_frame_facts())
+        except Exception as _e:                               # noqa: BLE001
+            logger.warning(f"[示范录制] 落帧失败：{_e!r}")
+
+    def _nt_miss_dump_dir(self):
+        '''丢名字存图的目录（默认 <应用根>/debug；自检可用 self.debug_dir 覆盖）。'''
+        _d = getattr(self, "debug_dir", None)
+        if _d:
+            return _d
+        try:
+            return ensure_dir("debug")
+        except OSError:
+            return None
+
+    def _dump_nametag_miss(self, streak):
+        '''
+        丢名字时把"当时的画面"存两张图到 debug/（**纯观测**，诊断用）。
+
+        为什么需要（2026-10-14 真机）：12:43 那轮只跑了 4.6 分钟，就有
+        `[名字定位] 已连续 N 帧` 告警 33 条（miss 最高 71），可日志里**没有画面**
+        ⇒ 分不清到底是哪一种：
+          · 名牌被画面边缘裁掉（角色太靠上）   · 名牌被地形/其它玩家挡住
+          · 角色根本不在画面里                 · 分数判错（模板不贴合）
+        存图之后，下一轮跑一段就能直接看图定性，不用再猜。
+
+        存的东西：
+          · `..._miss<N>_full.png`：整帧，绿框 = 上次命中的名牌位置、
+            黄十字 = 由此推出的角色位置、红框 = 本帧索敌框；
+          · `..._miss<N>_crop.png`：名牌本该在的位置 ±(模板 + 60px)，最近邻放大 3 倍。
+
+        ⚠️ 与判定完全无关：**不改** loc_*、不写存盘、不碰指令；任何异常都只吼一次
+           （`nt_miss_dump_failed`），绝不让主循环挂掉。节流 5 秒；调用点本身只在
+           miss 跨过 30 的整倍数那一帧（见 update_info_on_img_frame 的 `_streak`）。
+        ⚠️ 开关是 `nametag.miss_dump`（默认 true，见 config_default.yaml）。
+        '''
+        if not bool((self.cfg.get("nametag") or {}).get("miss_dump", True)):
+            return
+        now = time.time()
+        if now - float(getattr(self, "t_nt_miss_dump", 0.0) or 0.0) < 5.0:
+            return
+        try:
+            frame = getattr(self, "img_frame", None)
+            if frame is None or int(getattr(frame, "size", 0) or 0) == 0:
+                return
+            self.t_nt_miss_dump = now   # 先记账：下面失败也不要每帧重试刷屏
+            _tpl = getattr(self, "img_nametag", None)
+            if _tpl is None:
+                _th, _tw = 20, 60
+            else:
+                _th, _tw = int(_tpl.shape[0]), int(_tpl.shape[1])
+            if _tw <= 0 or _th <= 0:
+                _tw, _th = 60, 20
+            x, y = int(self.loc_nametag[0]), int(self.loc_nametag[1])
+            _off = int((self.cfg.get("nametag") or {}).get("offset", [0, 30])[1])
+            _h_f, _w_f = frame.shape[:2]
+            _score = float(getattr(self, "nametag_score", -1.0))
+            _dir = self._nt_miss_dump_dir()
+            if not _dir:
+                return
+            ensure_dir(_dir)
+            _base = f"nt_miss_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}_miss{int(streak)}"
+            _full_p = os.path.join(_dir, f"{_base}_full.png")
+            _crop_p = os.path.join(_dir, f"{_base}_crop.png")
+            # ── 整帧：三个标记（绿=上次命中名牌、黄十字=角色、红=本帧索敌框）──
+            _vis = frame.copy()
+            cv2.rectangle(_vis, (x, y), (x + _tw, y + _th), (0, 255, 0), 2)
+            _px, _py = x + _tw // 2, y - _off
+            cv2.line(_vis, (_px - 12, _py), (_px + 12, _py), (0, 255, 255), 2)
+            cv2.line(_vis, (_px, _py - 12), (_px, _py + 12), (0, 255, 255), 2)
+            try:
+                _bx0, _by0, _bx1, _by1 = self.get_search_box()
+                cv2.rectangle(_vis, (int(_bx0), int(_by0)),
+                              (int(_bx1), int(_by1)), (0, 0, 255), 2)
+            except Exception:
+                pass
+            # ── 裁图：名牌本该在的位置 ±(模板 + 60px)，放大 3 倍 ────────────
+            _m = max(int(_tw), int(_th)) + 60
+            _cx0, _cy0 = max(0, x - _m), max(0, y - _m)
+            _cx1 = min(int(_w_f), x + _tw + _m)
+            _cy1 = min(int(_h_f), y + _th + _m)
+            _crop = frame[_cy0:_cy1, _cx0:_cx1]
+            if int(getattr(_crop, "size", 0) or 0) == 0:
+                _crop, _cx0, _cy0 = frame, 0, 0
+            _crop = cv2.resize(_crop, None, fx=3.0, fy=3.0,
+                               interpolation=cv2.INTER_NEAREST)
+            cv2.rectangle(_crop,
+                          (int((x - _cx0) * 3), int((y - _cy0) * 3)),
+                          (int((x - _cx0 + _tw) * 3), int((y - _cy0 + _th) * 3)),
+                          (0, 255, 0), 2)
+            _ok1 = imwrite_unicode(_full_p, _vis)
+            _ok2 = imwrite_unicode(_crop_p, _crop)
+            if not (_ok1 and _ok2):
+                raise OSError(f"imwrite 失败（full={_ok1} crop={_ok2}）")
+            self.nt_miss_dump_failed = False
+            logger.info(
+                f"[名字定位·丢画面] miss={int(streak)} 分数={_score:.4f} ⇒ 已存 "
+                f"{os.path.join('debug', os.path.basename(_full_p))} 与 "
+                f"{os.path.join('debug', os.path.basename(_crop_p))}\n"
+                f"        绿框 = 上次命中的名牌位置 / 黄十字 = 由此推的角色位置 / "
+                f"红框 = 本帧索敌框；裁图 = 名牌本该在的位置 ±{_m}px 放大 3 倍。")
+        except Exception as e:
+            if not getattr(self, "nt_miss_dump_failed", False):
+                self.nt_miss_dump_failed = True
+                logger.warning(
+                    f"[名字定位·丢画面] 存图失败：{e!r} —— 不影响挂机（只吼这一次）。")
+
+    def _nametag_pos_plausible(self, loc_nametag, w_match):
+        '''
+        名字匹配算出来的**角色位置**是否可能（画面外假命中护栏，2026-10-13 加）。
+
+        返回 `(ok, cand)`：
+          · `cand` = 由这次匹配算出的角色位置（客户区坐标）；
+          · `ok=False` ⇒ 这个匹配是假的，调用方要按"未命中"处理
+            （loc_nametag 保持上一帧的值、nametag_miss_streak += 1）。
+        为什么需要（真机实录）：用户 12 帧里 **4 帧**算出 loc=(21,-30)（负 y、贴左上角）
+        —— 名字模板匹配到了左上角小地图面板的文字。位置**错了**比位置偏了更糟：
+        索敌框、攻击框、回正判据全以它为中心 ⇒ 会"框在错误的地方"。
+
+        判据（都不依赖跨帧状态）：
+          ① 角色位置不可能是负数（客户区坐标；人在画面里才会有名牌）；
+          ② 拿得到 `img_frame.shape` 时，位置必须落在客户区内（留 4px 贴边余量）。
+        ⚠️ 取不到帧尺寸 ⇒ **只做①**：那是"无法判定"，不是"放行"——
+           新自检 tools/verify_mob_sight.py 的 [9] 把这条口径钉住。
+        '''
+        try:
+            _off = int(self.cfg["nametag"]["offset"][1])
+        except (KeyError, TypeError, ValueError, IndexError):
+            _off = 0
+        try:
+            cand = (int(loc_nametag[0]) + int(w_match) // 2,
+                    int(loc_nametag[1]) - _off)
+        except (TypeError, ValueError, IndexError):
+            return True, (0, 0)
+        if cand[0] < 0 or cand[1] < 0:
+            return False, cand
+        _f = getattr(self, "img_frame", None)
+        if _f is None:
+            return True, cand
+        try:
+            _fh, _fw = _f.shape[:2]
+        except Exception:                                    # noqa: BLE001
+            return True, cand
+        _mg = 4
+        if -_mg <= cand[0] <= _fw + _mg and -_mg <= cand[1] <= _fh + _mg:
+            return True, cand
+        return False, cand
 
     def get_player_location_by_nametag(self):
         '''
@@ -1321,11 +1846,71 @@ class MapleStoryAutoBot:
         tag_type, loc_nametag, score, w_match, h_match, is_cached, used_fallback = \
             _accepted or _best_try
 
+        # ── 画面外假命中护栏（2026-10-13 加）────────────────────────────────
+        # 用户真机 12 帧里 **4 帧**算出 loc=(21,-30)（负 y、贴左上角）——
+        # 名字模板匹配到了小地图面板/其它 UI 文字。位置**错了**比位置偏了更糟：
+        # 索敌框、攻击框、回正判据全以它为中心 ⇒ 框在错误的地方（正是本轮要治的病）。
+        # 判据与"无法判定"的处置都写在 _nametag_pos_plausible 里（自检直接测它）。
+        _plausible, _cand = self._nametag_pos_plausible(loc_nametag, w)
+        _thres = float(self.cfg["nametag"]["diff_thres"])
+        _score_ok = bool(score < _thres)
+        _accept = bool(_score_ok and _plausible)
+        # ── 抗闪（2026-10-14 加）────────────────────────────────────────────
+        # 分数卡在"半峰"（认不出、又远没到完全失配）时也采信这一帧，只要位置不跳。
+        # 目的不是"多认出来几次"，而是**别让 miss 计数涨过 stale_pos_full_frame_after**
+        # （涨过之后索敌框放大到整帧 ⇒ 怪数虚高 + 去追画面外的目标，
+        #  见 log/MSBot_2026-10-14_11-42-16.log）。
+        # ⚠️ 判据只有 nametag_relax_decision 一处；这里只负责"用它 + 打日志"。
+        # ⚠️ 放宽采信**不进锚点、不写存盘**（见 accept 分支）。
+        _relax = False
+        _why = ""
+        self.nametag_relaxed = False
+        if not _accept:
+            _relax, _why, _relax_d = nametag_relax_decision(
+                score, _thres, self.cfg["nametag"].get("relax_ratio", 1.0),
+                self.cfg["nametag"].get("relax_max_jump", 12), _cand, self._nt_strict_pos)
+            if _relax and not _plausible:
+                _relax = False
+                _why = "位置落在画面外（假命中护栏先把它拦下了）"
+            _nrel = time.time()
+            if _relax:
+                _accept = True
+                self.nametag_relaxed = True
+                self.nametag_relax_hits += 1
+                if _nrel - float(getattr(self, "t_nametag_relax_log", 0.0)) > 5.0:
+                    self.t_nametag_relax_log = _nrel
+                    logger.info(
+                        f"[名字定位·抗闪] 第 {self.nametag_relax_hits} 次放宽采信：{_why}"
+                        f"（位置先按这一帧的候选，免得 miss 计数涨到触发"
+                        f"「索敌框放大到整帧」）")
+            elif _why and _nrel - float(getattr(self, "t_nametag_relax_log", 0.0)) > 30.0:
+                self.t_nametag_relax_log = _nrel
+                logger.warning(f"[名字定位·抗闪] 没敢采信这一帧：{_why}")
+        if _score_ok and not _plausible:
+            _now_g = time.time()
+            if _now_g - float(getattr(self, "t_nametag_guard_log", 0.0)) > 5:
+                self.t_nametag_guard_log = _now_g
+                logger.warning(
+                    f"[名字定位] 分数 {score:.4f} 过了阈值"
+                    f"（{self.cfg['nametag']['diff_thres']}），但算出来的角色位置 "
+                    f"{_cand} 在画面外 → 判为**假命中**，本帧按未命中处理"
+                    f"（位置沿用上一帧）。多半是匹配到了小地图/UI 文字："
+                    f"换一张更有特征的 nametag 模板，或把 nametag.diff_thres 收严")
         # Only update nametag location when score is good enough
-        if score < self.cfg["nametag"]["diff_thres"]:
+        if _accept:
             self.loc_nametag = loc_nametag
             self.nametag_miss_streak = 0
             self.nametag_hit = True
+            # ★ 只有**严格命中**才算"可信锚点"：更新抗闪锚点 + 把位置存盘
+            #   （节流 5 秒一次，见 _save_nametag_pos）—— 下次开局若名字认不到，
+            #   就能先按这个位置出招，而不是停在画面左上角。
+            #   ⚠️ 放宽采信的帧只用来"保住位置、避免整帧索敌"：不进锚点、不落盘，
+            #      否则位置会被一串放宽帧链式带跑（理由见 common.nametag_relax_decision）。
+            #   ⚠️ 识别逻辑本身没有被本改动动过：存盘只是"顺带记一笔"。
+            if not self.nametag_relaxed:
+                if _cand is not None:
+                    self._nt_strict_pos = (int(_cand[0]), int(_cand[1]))
+                self._save_nametag_pos(w_match=w, score=score)
             if not self.nametag_ever_hit:
                 self.nametag_ever_hit = True
                 logger.info(
@@ -1417,6 +2002,89 @@ class MapleStoryAutoBot:
 
         return loc_player_global
 
+    def _goal_pixel_skip_params(self):
+        '''「goal 像素不再吃掉整帧」的参数：返回 (enabled, y_tol, goal_y)。
+
+        ★ 2026-10-14 用户 m08867 拍板（回应 m08737「读取日志，查看导航问题」）。
+
+        真机现场（`log/MSBot_2026-10-14_15-47-36.log`）：
+          15:59:34–16:05:07（**5.5 分钟**）角色站在本段终点**正下方 8px**
+          （全局 (48,86)、段3/4），每帧指令都是 `none none goal` —— 因为它离
+          本段的 goal 圆点最近，而 goal 的命令是"什么都不做"；同时
+          `check_reach_goal()` 又因为 `|86-78| = 8 > route.goal_reach_y_tol(3)`
+          拒绝切段 ⇒ **「命令不让动 + 段不让切」= 原地冻死**。
+          更要命的是**回正线进不来**：回正的门槛是"方圆内一个路线像素都找不到"，
+          而这里"找到了"（goal 像素）⇒ 用户 16:05 手绘的那条回正线在最该用它的时候
+          用不上。最后是用户手动停机才结束的。
+          （对照：16:21:06 `[回正·小结] 成功回主线 | 1.9s/56帧 | (76,86)→(68,78)`
+           —— 只要回正进得去，1.9 秒就能从 y=86 回到 y=78 的主线。）
+
+        返回：
+            enabled：本层是否生效。任何一种"判不了"的情况（关掉 / 配置畸形 /
+                     `goal_reach_y_tol <= 0`（用户把高度闸关了，此时 goal 本来就
+                     该切段）/ 拿不到本段终点的 y）都 ⇒ **False**，即完全退回老行为。
+            y_tol：与 `check_reach_goal()` **共用同一个** `route.goal_reach_y_tol`
+                   （默认 3）—— 两条路径必须用同一个高度判据，否则又是一次
+                   "改一处漏一处"（见 check_reach_goal 里 2026-09-27 那段注释）。
+            goal_y：本段终点的 y（够不到就是 None）。
+        '''
+        _raw_on = self.cfg.get("route", {}).get("goal_pixel_skip", 1)
+        if _raw_on is None:      # yaml 里写成空的 `goal_pixel_skip:` ⇒ 按出厂值
+            _raw_on = 1          # （只有显式写 0 才是"关掉本层"）
+        try:
+            _on = int(_raw_on)
+        except (TypeError, ValueError):
+            _on = 1
+        try:
+            _tol = int(self.cfg.get("route", {}).get("goal_reach_y_tol", 3) or 0)
+        except (TypeError, ValueError):
+            _tol = 3
+        _goal_y = None
+        if _on > 0 and _tol > 0 and getattr(self, "_seg_goals", None):
+            _i = int(getattr(self, "idx_routes", 0) or 0)
+            if 0 <= _i < len(self._seg_goals):
+                try:
+                    _goal_y = int(self._seg_goals[_i][1])
+                except (TypeError, ValueError, IndexError):
+                    _goal_y = None
+        return (_on > 0 and _tol > 0 and _goal_y is not None), _tol, _goal_y
+
+    def _route_hit_unusable(self, hit, goal_y, y_tol):
+        '''这个路线像素**本帧**能不能用来驱动移动？不能就返回 (True, 为什么)。
+
+        ⚠️ 刻意只判两类（收窄改动面，"宁可少管，也不要动到正常跟随"）：
+          ① **goal 像素，但高度差 > 容差** —— 它的命令是 `none none goal`（不动），
+             而 `check_reach_goal()` 正因同一个高度判据拒绝切段 ⇒ 用它就是干站。
+          ② **纯横向像素**（`left/right none none`）却在**另一层**（|Δy| > 容差）——
+             朝它走也走不过去；真机表现是"在另一层左右来回蹭"
+             （`log/MSBot_2026-10-14_15-47-36.log` 16:18:43–16:19:19 的 40 秒：
+              指令在 `right none none` / `left none none` 之间翻，角色不挪窝）。
+        其余一律放行（含 `up/down`、`jump`、`teleport` 任何像素）。
+        '''
+        if hit is None:
+            return False, ""
+        if not self.loc_player_global:
+            return False, ""
+        _cmd = str(hit.get("command", "")).split()
+        if len(_cmd) != 3:
+            return False, ""
+        _py = int(hit["pixel"][1])
+        _y = int(self.loc_player_global[1])
+        if "goal" in _cmd:
+            if goal_y is None:
+                return False, ""
+            _dg = abs(_y - int(goal_y))
+            if _dg > y_tol:
+                return True, (f"它是本段 goal 像素、而高度差 {_dg}px > 容差 {y_tol}px"
+                              f"（人 y={_y} / 终点 y={int(goal_y)}）—— 还在半路，"
+                              f"命令 `none none goal` 不会让角色动")
+            return False, ""
+        if _cmd[0] in ("left", "right") and _cmd[1] == "none" and _cmd[2] == "none" \
+                and abs(_y - _py) > y_tol:
+            return True, (f"它在另一层（像素 y={_py} / 人 y={_y}，差 {abs(_y - _py)}px "
+                          f"> 容差 {y_tol}px）—— 朝它走也走不过去")
+        return False, ""
+
     def get_nearest_color_code(self):
         '''
         Searches for the nearest color-coded action marker
@@ -1439,8 +2107,30 @@ class MapleStoryAutoBot:
         x0, y0 = self.loc_player_global
         h, w = self.img_route.shape[:2]
 
-        def _scan(radius, center):
-            """在 center 周围给定半径内找最近的路线色码，返回 (nearest, nearest_up_down, 扫描框)。"""
+        # ── E1：goal 像素不再吃掉整帧（2026-10-14，用户 m08867 拍板）────────────
+        # 详见 `_goal_pixel_skip_params()` / `_route_hit_unusable()` 的注释。
+        # 这里做三件事：
+        #   ① 取参数（判据不可用 ⇒ 整层不启用，退回老行为）；
+        #   ② 每次扫描之后过滤掉"本帧用不了"的像素，并在**同一个搜索框**里换一个
+        #      真能用的（两类都换，见 `_filter_hit`）：
+        #        · goal 像素 ⇒ 排除 goal 后重扫；换不到 ⇒ 本帧确实没有可用像素；
+        #        · 侧向"另一层"像素 ⇒ 换一个可用像素，换不到就**退回用它**
+        #          （2026-10-14 加，用户 m09666 拍板；改前这里是"直接放弃"）。
+        #   ③ 过滤发生时（5s 节流）打一行 `[路线·goal过滤]` 说明"为什么没用它"。
+        # ⚠️ 只有 goal 分支会出现"过滤后一个像素都不剩" ⇒ 本函数返回 (None, None)
+        #    ⇒ `update_cmd_by_route` 走"找不到路线像素"那条路
+        #    ⇒ **回正线 / 救援**接管（这正是本层的目的）。
+        _skip_on, _y_tol, _goal_y = self._goal_pixel_skip_params()
+
+        def _scan(radius, center, skip_goal=False, usable_only=False):
+            """在 center 周围给定半径内找最近的路线色码，返回 (nearest, nearest_up_down, 扫描框)。
+
+            skip_goal=True：重扫时**排除 goal 像素**（E1 换像素用）。
+            usable_only=True：只接受"本帧真能用"的像素（判据 = `_route_hit_unusable`，
+                侧向换像素用，见 `_filter_hit` 里 2026-10-14 的那段注释）。
+                ⚠️ 上下码（`color_code_up_down`）**不受两个开关影响** —— E1 只管
+                   `color_code`（爬梯指令本来就能动，没有"用它=干站"的问题）。
+            """
             cx, cy = center
             bx_min = max(0, cx - radius)
             bx_max = min(w, cx + radius)
@@ -1461,8 +2151,19 @@ class MapleStoryAutoBot:
                 for x in range(bx_min, bx_max):
                     pixel = tuple(self.img_route[y, x])  # (R, G, B)
                     dist = abs(x - cx) + abs(y - cy)
+                    # usable_only（2026-10-14）：这个像素本帧能不能用？
+                    # ⚠️ 只在真的命中色码时才问一次判据（否则每像素都建 dict，白花时间）。
+                    _ok_cc = True
+                    if usable_only and _skip_on and pixel in self.color_code:
+                        _ok_cc = not self._route_hit_unusable(
+                            {"pixel": (x, y), "color": pixel,
+                             "command": self.color_code[pixel],
+                             "distance": dist},
+                            _goal_y, _y_tol)[0]
                     # Get nearest color
-                    if pixel in self.color_code and dist < md:
+                    if _ok_cc and pixel in self.color_code and dist < md \
+                            and not (skip_goal
+                                     and "goal" in str(self.color_code[pixel])):
                         n = {
                             "pixel": (x, y),
                             "color": pixel,
@@ -1481,8 +2182,80 @@ class MapleStoryAutoBot:
                         md_ud = dist
             return n, n_ud, (bx_min, by_min, bx_max, by_max)
 
-        nearest, nearest_up_down, scan_box = _scan(self.cfg["route"]["search_range"],
-                                                   self.loc_player_global)
+        def _filter_hit(n, radius, center):
+            """E1：返回 (本帧可用的像素 或 None, 丢弃说明, 处置种类)。
+
+            处置种类（`_scan_filtered` 打日志用，也是本层**唯一的对外语义**）：
+              ""         本次没触发过滤（像素照旧）
+              "alt"      换到了**另一个**本帧真能用的像素
+              "fallback" 侧向像素换不到别的 ⇒ **仍按它走**（老行为，2026-10-14）
+              "none"     goal 像素且换不到 ⇒ 本帧没有可用像素（交给回正 / 救援）
+            """
+            if not _skip_on or n is None:
+                return n, "", ""
+            _bad, _why = self._route_hit_unusable(n, _goal_y, _y_tol)
+            if not _bad:
+                return n, "", ""
+            _detail = _why
+            if "goal" in str(n.get("command", "")):
+                _alt, _alt_ud, _box = _scan(radius, center, skip_goal=True)
+                if _alt is None:
+                    _detail += "；排除 goal 像素后这个搜索框里一个路线像素都没有"
+                else:
+                    _bad2, _why2 = self._route_hit_unusable(_alt, _goal_y, _y_tol)
+                    if not _bad2:
+                        return _alt, "", "alt"
+                    _detail += (f"；排除 goal 后最近的像素 "
+                                f"{tuple(int(v) for v in _alt['pixel'])} 也用不了"
+                                f"（{_why2}）")
+                return None, _detail, "none"
+            # ── ② 侧向（"另一层"）分支：2026-10-14 修（用户 m09666 拍板）──────────
+            # E1 第一版这里是"直接返回 None ⇒ 整帧交给回正线 / 失联救援"。
+            # 真机代价（`log/MSBot_2026-10-14_16-51-02.log`，465s，第一份带新配置的
+            # 会话）：`[路线·goal过滤]` 46 次，**46/46 全部以「本帧没有可用的路线
+            # 像素」收场**，"改用别的像素" 0 次；理由 45/46 是"另一层"，
+            # Δy 分布 4px=12 / 8px=17 / 9px=1 / 12px=11 / 24px=5，触发间隔 p50=5s
+            # （= 日志节流上限 ⇒ 几乎每有机会就触发）。后果（次/分钟，对比 55 分钟
+            # 的旧会话 `MSBot_2026-10-14_15-47-36.log`）：
+            #   `[回正]` 2.2 → 14.2（6.5×）、`[路线失联]` 0.9 → 3.4（3.8×）、
+            #   `[回正·小结]` 0.22 → 1.03（4.7×）；8 条小结里 6 条是
+            #   「一次都没走到起跳点 | 离回正线 22~80px、离主线 0px」
+            #   ⇒ 进去就被判"接不上"退出，并把那条回正线**去武装**。
+            # 为什么 4px 也会被判"另一层"：本图相邻路线行距只有 4~8px
+            #   （y=86/78/74/70/66/58/54），而这里的容差复用的是
+            #   `goal_reach_y_tol`=3 ⇒ 正常跟随时的坐标抖动就够触发；
+            #   真正的换层是 24~48px 量级。
+            # ⇒ 新行为（与 goal 分支对称，但**不放弃**）：
+            #   ① 先在同一个搜索框里换一个"本帧真能用"的像素；
+            #   ② 换不到 ⇒ **退回用它**（老行为 `left/right none none`）。
+            #      绝不因为"它可能在另一层"就把整帧交给回正 / 救援 ——
+            #      「站着不动 / 被回正拽走并去武装一条线」比「朝同排像素走一步」差得多。
+            _alt, _alt_ud, _box = _scan(radius, center, usable_only=True)
+            if _alt is not None:
+                return _alt, _why, "alt"
+            return (n, _why + "；同一个搜索框里换不到别的可用像素 ⇒ 本帧仍按它走"
+                              "（退回老行为）", "fallback")
+
+        def _scan_filtered(radius, center):
+            """扫描 + E1 过滤（过滤发生时 5s 节流打一行日志）。"""
+            n, n_ud, box = _scan(radius, center)
+            n, _why, _kind = _filter_hit(n, radius, center)
+            if _why and time.time() - getattr(self, "t_goal_skip_log", 0.0) > 5:
+                self.t_goal_skip_log = time.time()
+                if _kind == "alt":
+                    _use = f"改用 {tuple(int(v) for v in n['pixel'])}（{n['command']}）"
+                elif _kind == "fallback":
+                    _use = (f"仍按它走（{n['command']}）—— 换不到别的可用像素，"
+                            f"本帧不再交给回正 / 救援")
+                else:
+                    _use = "本帧没有可用的路线像素 ⇒ 交给回正线 / 救援接管"
+                logger.info(
+                    f"[路线·goal过滤] 最近的路线像素没用：{_why}\n"
+                    f"        {_use}；`route.goal_pixel_skip` 填 0 = 关掉本层")
+            return n, n_ud, box
+
+        nearest, nearest_up_down, scan_box = _scan_filtered(
+            self.cfg["route"]["search_range"], self.loc_player_global)
 
         # 失联救援（2026-09-12）：被怪碰撞/打怪位移很容易偏离路线超过正常搜索半径
         # （默认仅 10px）→ 指令真空、干站发呆，只能等 watchdog 抽随机动作（实测）。
@@ -1498,21 +2271,39 @@ class MapleStoryAutoBot:
                 level = None
                 anchor = getattr(self, "loc_last_route_pixel", None)
                 if anchor is not None:
-                    nearest, nearest_up_down, scan_box = _scan(rescue, anchor)
+                    nearest, nearest_up_down, scan_box = _scan_filtered(rescue, anchor)
                     if nearest is not None or nearest_up_down is not None:
                         level = f"接回当前段（锚点 {anchor}）"
                 if nearest is None and nearest_up_down is None:
-                    nearest, nearest_up_down, scan_box = _scan(rescue, self.loc_player_global)
+                    nearest, nearest_up_down, scan_box = _scan_filtered(
+                        rescue, self.loc_player_global)
                     if nearest is not None or nearest_up_down is not None:
                         level = "严重偏移，接入最近段"
                 if level is not None and \
                         time.time() - getattr(self, "t_route_rescue_log", 0) > 5:
                     self.t_route_rescue_log = time.time()
                     hit = nearest if nearest is not None else nearest_up_down
+                    # ⚠️ 2026-10-14 修文案（用户 m08454 报「偏离路线后站着不动」）：
+                    #   原来打的是 `hit["distance"]` —— 那是**扫描中心到该像素**的距离；
+                    #   而 Level 2 的扫描中心正是"锚点"本身（锚点必然是个路线像素）
+                    #   ⇒ 那个数字恒为 0。用户看到「距离 0px」会以为"角色就在路线上"，
+                    #   实际日志里角色离它 16~22px（`log/MSBot_2026-10-14_15-07-02.log`
+                    #   的 `(74,54)` vs 锚点 `(58,76)`）。
+                    #   ⇒ 改成打**到角色的实际距离** + 路线像素坐标。
+                    #   顺带点明"锚点是 goal 像素"这种接不动的接引（命令是
+                    #   `none none goal`，一个不会让角色移动的命令）。
+                    _hp = tuple(int(v) for v in hit["pixel"])
+                    _d_play = abs(_hp[0] - int(self.loc_player_global[0])) + \
+                        abs(_hp[1] - int(self.loc_player_global[1]))
+                    _goal_hint = ""
+                    if "goal" in str(hit["command"]):
+                        _goal_hint = ("；⚠️ 这个像素是本段的 goal 像素 ⇒ 接引命令"
+                                      "（none none goal）**不会让角色移动**，"
+                                      "若接下来一直干站，就是这里接错了段")
                     logger.warning(
                         f"[路线失联] 角色已偏离路线（小地图位置 {self.loc_player_global}），"
                         f"{level}，重新接引：{hit['command']}"
-                        f"（距离 {hit['distance']}px）")
+                        f"（路线像素 {_hp}，到角色 {_d_play}px）{_goal_hint}")
 
         # Debug 绘制：搜到路线像素时画搜索框 + 角色到路线的连接线。
         # ⚠️ 同 get_player_location_on_global_map：原来没判 viz 状态，img_route_debug
@@ -1582,6 +2373,649 @@ class MapleStoryAutoBot:
 
         return (x0, y0, x1, y1)
 
+    def get_detect_extent(self):
+        '''
+        「感知框」的半宽/半高 (dx, dy) —— 只决定**看得见多远**，不决定打不打。
+
+        与攻击框（get_attack_range）的区别（2026-10-13 用户选的方案 A）：
+          · 攻击框 = 技能真打得到的范围（aoe: range/2；directional: range）；
+          · 感知框 = 攻击框口径 + `search_box_margin`，再乘
+            `monster_detect.detect_range_scale`。
+        为什么要分开：旧实现两者是同一个框（±(range/2+margin) = 500×270，只占
+        1366×768 客户区的 13%）。用户真机实测 12 帧：整帧 53 只怪里 **46 只（87%）
+        落在框外** ⇒ 现象是"身边明摆着有怪，机器人不认"。
+        放大感知范围**不改变攻击范围**：够不着的怪交给 approach_mob 走过去打。
+
+        ⚠️ 默认 scale = 1.0（= 老行为）；出厂配置 `config/config_default.yaml`
+           显式写 2.0。自检夹具（自己拼 cfg 的那些）不写这个键 ⇒ 框与老口径一致，
+           不会因为这次改动出现"夹具期望值全部要改"的连带。
+        '''
+        _md = self.cfg.get("monster_detect") or {}
+        try:
+            _margin = int(_md.get("search_box_margin", 50) or 0)
+        except (TypeError, ValueError):
+            _margin = 50
+        if self.cfg["bot"]["attack"] == "aoe_skill":
+            dx = self.cfg["aoe_skill"]["range_x"] // 2 + _margin
+            dy = self.cfg["aoe_skill"]["range_y"] // 2 + _margin
+        elif self.cfg["bot"]["attack"] == "directional":
+            dx = self.cfg["directional_attack"]["range_x"] + _margin
+            dy = self.cfg["directional_attack"]["range_y"] + _margin
+        else:
+            dx = dy = _margin
+        try:
+            _scale = float(_md.get("detect_range_scale", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            _scale = 1.0
+        if _scale < 1.0:      # 负/0/0.x：夹回 1.0（"看得更少"没有意义，只会白白漏怪）
+            _scale = 1.0
+        # ★ 2026-10-13 加：**竖直方向单独一个倍数**（`detect_range_scale_y`）。
+        #   为什么需要：感知框唯一的下游用途是 approach_mob「走过去打」，
+        #   而它只在**同一层**才敢走（|dy| <= approach_dy_tol = 60）。
+        #   ⇒ 竖直方向多看到 ±270px 是纯浪费：真机 12 帧里 60% 的怪在
+        #     角色上方 280~320px（上层平台），既够不着也走不过去。
+        #   实测（tools/verify_monster 的 12 帧，模板 10 张含翻转）：
+        #     1000×540 = 141ms；1000×296（本键 1.1）= 77ms ⇒ **省 45% 的检测耗时**，
+        #     而 x 方向的可达范围一点没少。缺键 ⇒ 沿用 detect_range_scale（老口径）。
+        try:
+            _scale_y = float(_md.get("detect_range_scale_y", _scale) or _scale)
+        except (TypeError, ValueError):
+            _scale_y = _scale
+        if _scale_y < 1.0:
+            _scale_y = 1.0
+        return int(round(dx * _scale)), int(round(dy * _scale_y))
+
+    def get_search_box(self):
+        '''
+        本帧怪检测的**索敌框** (x0, y0, x1, y1)（客户区坐标，已 clamp 到帧内）。
+
+        ⚠️ 这个函数是"画出来的框"与"怪检测真正用的框"的**唯一出处**：
+           `update_cmd_by_mob_detection` 与帧尾画框（update_info_on_img_frame_debug）
+           都必须调它。历史上这两处各算一遍，注释里靠"纯函数所以必然一致"来保证 ——
+           本轮加了 detect_range_scale / stale 放大之后，这个保证不再成立，
+           所以改成同一个函数（tools/verify_mob_boxes.py 的 [6b] 钉这条）。
+
+        位置连续丢失（nametag_miss_streak >= stale_pos_full_frame_after）时，
+        （⚠️ 该键 **2026-10-14 起默认 0 = 关掉下面这条放大**，见 config_default.yaml）
+        把索敌框**临时放大到整帧**：位置都已经不可信了，还拿它当中心只会把怪框在
+        错误的位置外（"框错了"比"框大了"更糟 —— 大了只是多算几次模板匹配）。
+
+        ★ 2026-10-14 加第三条（低频识别优化 P2，用户 m05009「落地」）：
+           **交战期间只扫「攻击框 + search_box_margin」**（`engaged_scan`，默认开）。
+           为什么：一次怪检测 17.1ms 里 ~99% 是模板匹配，而匹配耗时 ∝ 扫描面积。
+           实测（`_probe_detect_cost.py`，帧 800×1368、感知框 660×264、攻击框 340×140、
+           4 张模板×2 镜像 = 8 次匹配）：**全框 17.1ms → 只扫攻击框 7.2ms（-58%）**，
+           单张模板 2.11ms → 0.51ms。交战期间要回答的问题只有"目标还在不在、
+           有没有新怪靠过来"，这两件事都发生在攻击框附近；远处的怪等**松开那一帧**
+           重新扫全框完全来得及（松开后立刻回到全感知框）。
+           ⚠️ 顺序：位置失效（上面那条）**优先** —— 位置都不可信时必须扫全帧。
+           ⚠️ `engaged_scan: false` = 逐字退回老行为（交战期间照样扫全感知框）。
+        '''
+        _md = self.cfg.get("monster_detect") or {}
+        _h_f, _w_f = self.img_frame.shape[:2]
+        try:
+            _after = int(_md.get("stale_pos_full_frame_after", 0) or 0)
+        except (TypeError, ValueError):
+            _after = 0
+        if _after > 0 and int(getattr(self, "nametag_miss_streak", 0) or 0) >= _after:
+            return (0, 0, _w_f, _h_f)
+        if bool(getattr(self, "_stop_hold", False)) and bool(_md.get("engaged_scan", True)):
+            try:
+                _mgn = int(_md.get("search_box_margin", 50) or 0)
+            except (TypeError, ValueError):
+                _mgn = 50
+            _ab = []
+            try:
+                _ab = [self.get_attack_range(is_left=True)]
+                if self.cfg["bot"]["attack"] == "directional":
+                    _ab.append(self.get_attack_range(is_left=False))
+            except Exception as _e:                          # noqa: BLE001
+                # 算不出来就退回**全感知框**：看少了比看多了危险（会漏怪）。
+                # 落一条可查的日志 —— 这条出现就说明攻击框口径本身有问题。
+                logger.warning(f"[索敌框] 交战收紧算不出攻击框（{_e}）→ 本帧仍扫全感知框")
+            if _ab:
+                return (max(0, min(_b[0] for _b in _ab) - _mgn),
+                        max(0, min(_b[1] for _b in _ab) - _mgn),
+                        min(_w_f, max(_b[2] for _b in _ab) + _mgn),
+                        min(_h_f, max(_b[3] for _b in _ab) + _mgn))
+        dx, dy = self.get_detect_extent()
+        return (max(0, self.loc_player[0] - dx),
+                max(0, self.loc_player[1] - dy),
+                min(_w_f, self.loc_player[0] + dx),
+                min(_h_f, self.loc_player[1] + dy))
+
+    def _min_mob_area(self):
+        '''
+        怪与框「算交叠」的面积下限（像素²）。
+
+        与 `get_nearest_monster` 原实现同一个口径：所有模板里最小的那张的面积
+        （一张模板都没有时退回 0），再被 `monster_detect.max_mob_area_trigger` 封顶。
+        抽成 helper 是因为 `_mobs_in_attack_box` 也要用同一个下限 —— 两处各写一遍
+        就是"改一处漏一处"的经典形态。
+        ⚠️ 全用 .get + try：自检夹具常只拼几个键，直接下标会 KeyError 带崩既有自检。
+        '''
+        try:
+            _areas = [im.shape[0] * im.shape[1]
+                      for _, _imgs in (self.monsters_info or {}).items()
+                      for im, _ in _imgs]
+        except Exception:                                    # noqa: BLE001
+            _areas = []
+        _min_area = min(_areas) if _areas else 0
+        try:
+            _cap = int((self.cfg.get("monster_detect") or {})
+                       .get("max_mob_area_trigger", 1500) or 0)
+        except (TypeError, ValueError):
+            _cap = 1500
+        return min(_min_area, _cap)
+
+    def _engage_mode(self):
+        '''
+        「够得着」的判据名（`monster_detect.mob_engage_mode`）—— **只有这一处读**。
+
+        返回 `"center"` 或 `"min_area"`：
+          · `center`（**出厂默认**）：怪框中心落在攻击框内。
+          · `min_area`（老口径，保留可回退）：交叠面积 >= `_min_mob_area()`。
+        畸形值 / 缺键 / 读不到 ⇒ `"min_area"`（保守 = 老口径，绝不静默放宽）。
+        ⚠️ 判据名只在这里归一，`_mobs_in_attack_box()` 与 `[怪检测]` 明细行都调它 ——
+           同一判据写两处就会出现"日志说 center、判定却在用 min_area"这种静默失准。
+        '''
+        try:
+            _mode = str((self.cfg.get("monster_detect") or {})
+                        .get("mob_engage_mode", "min_area") or "min_area").strip().lower()
+        except Exception:                                     # noqa: BLE001
+            _mode = "min_area"
+        return _mode if _mode in ("min_area", "center") else "min_area"
+
+    def _engage_margin(self):
+        '''
+        「宽判定」的像素余量（`monster_detect.mob_engage_margin`）—— **只有这一处读**。
+
+        由来（用户 m08016 拍板「B 够得着判据加余量」，依据 = 2026-10-14 示范录制的读数）：
+          389 帧「引擎**看见了**怪、却判够不着」里，最近那只怪 **69% 只差在框外
+          ≤ 45px**（dx p50=6px / p90=45px；dy p50=0 / p90=42px）—— 就是"差一点点
+          就不算"。人眼是**预估**的（用户 m06810 原话：「人不能准确计算，只能预估
+          大概在范围内就会攻击，属于宽判定」），所以这里把攻击框向外扩 margin
+          像素，再拿扩过的框做够得着判定。
+
+        取值：`0` = 关掉（严格按技能框）；**缺键 ⇒ 40**（出厂默认 —— 老配置
+          文件里没有这个键时也照 40 走，否则会出现"改了却看不出变化"）；
+          畸形 / 负数 / > 200 ⇒ 0（保守：绝不因为配置写坏而静默放宽）。
+        ⚠️ 只放大**判定**用的框。画在屏幕上的攻击框仍是技能真实范围
+          （`get_attack_range()` 一个像素都不动）—— 免得屏幕上的框越画越大、
+          和技能真实范围对不上。
+        '''
+        try:
+            _raw = (self.cfg.get("monster_detect") or {}).get(
+                "mob_engage_margin", 40)
+        except Exception:                                     # noqa: BLE001
+            return 0
+        if _raw is None:
+            return 40
+        try:
+            _m = int(float(_raw))
+        except (TypeError, ValueError):
+            return 0
+        return _m if 0 <= _m <= 200 else 0
+
+    def _attack_boxes(self):
+        '''
+        「够得着」判定用的攻击框（**已加 `mob_engage_margin` 余量**）—— 只有这一处拼。
+
+        directional 模式合并左右两个框（与 `get_nearest_monster` 的两次调用一致）。
+        ⚠️ 三个消费点（`_mobs_in_attack_box` / `_engage_gap` / `[怪检测]` 明细行）
+          必须都走这里：各拼一遍就会出现"日志说差 6px、判定却在拿加过余量的框算"
+          这种静默失准（`03` §6 教训：改一处漏一处）。
+        '''
+        if self.cfg["bot"]["attack"] == "aoe_skill":
+            _bs = [self.get_attack_range(is_left=True)]
+        else:
+            _bs = [self.get_attack_range(is_left=True),
+                   self.get_attack_range(is_left=False)]
+        _m = self._engage_margin()
+        if _m:
+            _bs = [(_b[0] - _m, _b[1] - _m, _b[2] + _m, _b[3] + _m)
+                   for _b in _bs]
+        return _bs
+
+    def _mobs_in_attack_box(self):
+        '''
+        **攻击框内**的怪（"够得着、打得到"的那一批）。
+
+        ⚠️ 与索敌框（get_search_box）不是一回事：索敌框可能被 detect_range_scale
+           放大到只看不打的远距离。攻击判定、停下来打怪都以本函数为准 ——
+           否则会对着够不着的怪一直出招/一直站着。
+        directional 模式合并左右两个框（与 get_nearest_monster 的两次调用一致）。
+        交叠判据与 `get_nearest_monster` 同款（交叠面积 >= _min_mob_area()）。
+        ★ 2026-10-14 加 `monster_detect.mob_engage_mode` 开关（用户 m06668
+          「红色攻击框里有绿色的检测框，但是就是不攻击」）：
+            · `center`（**出厂默认**，2026-10-14 用户拍板"宽判定"）：怪框**中心**
+              落在攻击框内 ⇒ 算够得着。判据与眼睛一致、人眼可核对。
+            · `min_area`（老口径，保留可回退）：交叠面积 >= `_min_mob_area()`。
+              注意这条对**小怪**很严：`_min_mob_area()` 取的是本图**最小**那张模板的
+              面积（废铁2 = 青蛇 28×31 = 868px²），等于要求小怪**整个**框都落在攻击框
+              里 —— 差 1px 就不算"够得着"（人眼分辨不出 1px ⇒ 看着"在框里却不打"）。
+            非法/缺失 ⇒ 按 `min_area`（保守 = 老口径，绝不静默放宽）。
+        '''
+        # ★ 2026-10-14：框只在这里拼一次（`_attack_boxes()` 已含 `mob_engage_margin`）
+        _boxes = self._attack_boxes()
+        _thres = self._min_mob_area()
+        _mode = self._engage_mode()
+        out = []
+        for monster in self.monsters:
+            mx, my = monster["position"]
+            mw, mh = monster["size"]
+            for (bx0, by0, bx1, by1) in _boxes:
+                iw = max(0, min(bx1, mx + mw) - max(bx0, mx))
+                ih = max(0, min(by1, my + mh) - max(by0, my))
+                if _mode == "center":
+                    # 「怪框中心落在攻击框内」—— 与人的直觉一致（"它就在框里"）。
+                    # ⚠️ 不写"或交叠 >= 自身面积一半"：对轴对齐矩形，交叠 >= 自身面积
+                    #    的一半 ⇒ 两个方向都至少有一半在框内 ⇒ **必然**包含中心，
+                    #    那条分支是恒假的废话（写上去只会让人以为有额外语义）。
+                    cx, cy = mx + mw / 2.0, my + mh / 2.0
+                    if bx0 <= cx <= bx1 and by0 <= cy <= by1:
+                        out.append(monster)
+                        break
+                elif iw * ih >= _thres:
+                    out.append(monster)
+                    break
+        return out
+
+    def _engage_gap(self, mobs=None):
+        '''
+        「离**算够得着**最近的那一只还差多少」—— **只给日志文案用**（纯观测，不参与判定）。
+
+        由来（用户 m06668「红色攻击框里有绿色的检测框，但是就是不攻击」）：
+          只说"框外有 N 个目标"分不清三种完全不同的处境 ——
+            ① 差一点点 ⇒ 交叠判据太严（最小模板的**整个**面积才算够得着）；
+            ② **中心已经在攻击框里**却仍不算 ⇒ 判据与人的直觉不一致；
+            ③ 差得远 ⇒ 画出来的是索敌框，本来就不该打（预期行为）。
+
+        Returns:
+            (area, need, dx, dy, center_in) 或 None（算不出来 / 没怪）：
+              · area   离得最近的那只与攻击框的最大交叠面积（px²）
+              · need   "算够得着"需要的面积（`_min_mob_area()`）
+              · dx, dy 它中心离攻击框的水平/垂直距离（已在框内 = 0）
+              · center_in 怪框**中心**已在攻击框内的目标数
+        '''
+        _list = list(getattr(self, "monsters", None) or []) if mobs is None else list(mobs)
+        if not _list:
+            return None
+        try:
+            _need = int(self._min_mob_area())
+            # ★ 2026-10-14：与 `_mobs_in_attack_box()` 用**同一个**框（含
+            #   `mob_engage_margin`）—— 否则日志里的"差 N px"和实际判定用的框
+            #   不是一个东西，就会出现"日志说差 6px 却没算够得着"的怪相。
+            _boxes = self._attack_boxes()
+        except Exception:                                     # noqa: BLE001
+            return None
+        _best = None
+        _center_in = 0
+        for _m in _list:
+            try:
+                _mx, _my = _m["position"]
+                _mw, _mh = _m["size"]
+            except Exception:                                 # noqa: BLE001
+                continue
+            _cx, _cy = _mx + _mw / 2.0, _my + _mh / 2.0
+            _in_any = False
+            for (_bx0, _by0, _bx1, _by1) in _boxes:
+                _iw = max(0, min(_bx1, _mx + _mw) - max(_bx0, _mx))
+                _ih = max(0, min(_by1, _my + _mh) - max(_by0, _my))
+                _area = _iw * _ih
+                if _bx0 <= _cx <= _bx1 and _by0 <= _cy <= _by1:
+                    _in_any = True
+                    _dx = _dy = 0
+                else:
+                    _dx = int(max(_bx0 - _cx, 0.0, _cx - _bx1))
+                    _dy = int(max(_by0 - _cy, 0.0, _cy - _by1))
+                if _best is None or _area > _best[0]:
+                    _best = (_area, _dx, _dy)
+            if _in_any:
+                _center_in += 1
+        if _best is None:
+            return None
+        return (_best[0], _need, _best[1], _best[2], _center_in)
+
+    def _engage_gap_facts(self, mobs=None):
+        '''`_engage_gap()` 的 kwargs 版，供 `_mob_no_attack_log(..., **facts)` 直接用。
+
+        ⚠️ 纯观测：拿不到就返回**空 dict**（一个字都不加），绝不抛异常。
+        '''
+        _g = self._engage_gap(mobs)
+        if not _g:
+            return {}
+        return dict(gap_area=_g[0], gap_need=_g[1], gap_dx=_g[2], gap_dy=_g[3],
+                    center_in=_g[4])
+
+    def _attack_box_half(self):
+        '''
+        攻击框的半宽/半高（像素）—— **只给日志文案用**（纯观测，不参与任何判定）。
+
+        ⚠️ 口径必须与 get_attack_range() 一致（那里才是权威）：
+           aoe         → range_x//2 / range_y//2（以角色为中心，左右上下都有）
+           directional → range_x（**单侧**）/ range_y//2
+        '''
+        try:
+            _bot = self.cfg.get("bot") or {}
+            if _bot.get("attack") == "aoe_skill":
+                _a = self.cfg.get("aoe_skill") or {}
+                return int(_a.get("range_x", 0)) // 2, int(_a.get("range_y", 0)) // 2
+            _d = self.cfg.get("directional_attack") or {}
+            return int(_d.get("range_x", 0)), int(_d.get("range_y", 0)) // 2
+        except (TypeError, ValueError):
+            return 0, 0
+
+    def _game_window_front(self):
+        '''
+        游戏窗口是否在前台（True/False）；**拿不到就返回 None（未知）**。
+
+        ⚠️ 必须是三态：`None`（查不到：键盘控制器还没起、或查询抛了）与 `False`
+           （确认不在前台）是两回事 —— 文案里分开写，别把"不知道"写成"正常"。
+        '''
+        try:
+            _kb = getattr(self, "kb", None)
+            if _kb is None:
+                return None
+            return bool(_kb.is_game_window_active())
+        except Exception:                                     # noqa: BLE001
+            return None
+
+    def _note_attack(self, engage_n=0):
+        '''
+        纯观测：记一次「**真的**发出了 attack 指令」（2026-10-14 加）。
+
+        由来（用户真机反馈 m06529「攻击就是很慢」）：日志里 attack 指令只存在
+        **一帧**（下一帧就被清掉，见 update_cmd_by_mob_detection 里的残留清理），
+        所以按指令采样永远抓不到 —— 必须在这儿**数**，否则"出招频率"根本无从考证。
+
+        ⚠️ 不参与任何判定；任何异常都不许影响出招（调用点就在出招那一行上）。
+        '''
+        try:
+            _now = time.time()
+            _prev = float(getattr(self, "t_last_attack", 0.0) or 0.0)
+            self._atk_n = int(getattr(self, "_atk_n", 0)) + 1
+            if _prev > 0:
+                _gap = _now - _prev
+                # 只收合理间隔：跨"停下打怪/回正/爬梯"的巨大间隔会把平均值带偏
+                if 0 < _gap < 30.0:
+                    self._atk_gap_n = int(getattr(self, "_atk_gap_n", 0)) + 1
+                    self._atk_gap_sum = float(getattr(self, "_atk_gap_sum", 0.0)) + _gap
+                    self._atk_gap_max = max(
+                        float(getattr(self, "_atk_gap_max", 0.0) or 0.0), _gap)
+                    _mn = getattr(self, "_atk_gap_min", None)
+                    if _mn is None or _gap < float(_mn):
+                        self._atk_gap_min = _gap
+            _e = int(engage_n or 0)
+            self._atk_eng_max = max(int(getattr(self, "_atk_eng_max", 0)), _e)
+            _em = getattr(self, "_atk_eng_min", None)
+            if _em is None or _e < int(_em):
+                self._atk_eng_min = _e
+            # ★ 2026-10-14 加：**灵敏度的直接量** —— 第一只怪进攻击框到真正出刀
+            #   中间隔了多久（用户 m06852「攻击还是不够灵敏」）。只在"框内确实有怪"
+            #   的那一刀上算；锁定补招那一刀（engage_n=0）不算，否则会把"补一刀"
+            #   混进灵敏度里。`_eng_first_t` 由调用点在框内空了时清掉 ⇒ 这里的值
+            #   恒等于"这一批怪连续在框内的时长"。
+            if _e > 0:
+                _t_in = getattr(self, "_eng_first_t", None)
+                if _t_in:
+                    self._eng_first_t = None
+                    _ms = max(0.0, (_now - float(_t_in)) * 1000.0)
+                    if self.cfg["bot"]["attack"] == "aoe_skill":
+                        _cd = float((self.cfg.get("aoe_skill") or {}).get("cooldown", 0.0) or 0.0)
+                    else:
+                        _cd = float((self.cfg.get("directional_attack") or {})
+                                    .get("cooldown", 0.0) or 0.0)
+                    logger.info(
+                        f"[出招·延迟] 第一只怪进攻击框 → 出刀 用了 {_ms:.0f}ms"
+                        f"（检测每 {monster_detect_interval(self.cfg)} 帧一次；"
+                        f"设定冷却 {_cd:.2f}s）")
+        except Exception:                                     # noqa: BLE001
+            pass
+
+    def _log_attack_heartbeat(self):
+        '''
+        纯观测：`[出招] 近5秒出招 N 次 …`（2026-10-14 加，紧跟 [运行状态] 的 5 秒节拍）。
+
+        看什么：
+          · 出招 0 次 而画面有怪 ⇒ 去翻同刻的 `[没出招·归因]`（冷却？框外？绳梯让路？）
+          · 出招次数 ≈ 5 / 设定冷却 ⇒ 摸到了冷却上限，**冷却本身就是限速器**
+            （aoe_skill.cooldown 默认 0.05 = 只防重复按键；真机被设成 0.77 ⇒ 1.3 次/秒）
+          · 间隔远大于设定冷却 ⇒ 时间花在"没怪 / 走过去 / 爬梯"上，不是出招被卡
+        '''
+        try:
+            _n = int(getattr(self, "_atk_n", 0))
+            _gn = int(getattr(self, "_atk_gap_n", 0))
+            _avg = (float(getattr(self, "_atk_gap_sum", 0.0)) / _gn) if _gn else 0.0
+            _mn = getattr(self, "_atk_gap_min", None)
+            _mx = float(getattr(self, "_atk_gap_max", 0.0) or 0.0)
+            if _gn:
+                _gap = (f"间隔 平均{_avg:.2f}s/最小{float(_mn):.2f}s/最大{_mx:.2f}s")
+            else:
+                _gap = "间隔 -（本窗口没有连续两次出招）"
+            try:
+                if self.cfg["bot"]["attack"] == "aoe_skill":
+                    _cd = float(self.cfg["aoe_skill"].get("cooldown", 0.0))
+                else:
+                    _cd = float(self.cfg["directional_attack"].get("cooldown", 0.0))
+            except Exception:                                 # noqa: BLE001
+                _cd = 0.0
+            _em = getattr(self, "_atk_eng_min", None)
+            _eng = f"{int(_em)}~{int(getattr(self, '_atk_eng_max', 0))}" if _n else "-"
+            _tail = ""
+            if _n and _cd >= 0.3:
+                _tail = f"  ⚠️ 设定冷却 {_cd:.2f}s 就是限速器（上限约 {5.0 / _cd:.1f} 次）"
+            elif _n and _gn and _avg > _cd * 1.5 and _cd > 0:
+                _tail = "  ⇒ 没摸到冷却上限：时间花在没怪/走过去/爬梯上"
+            logger.info(
+                f"[出招] 近5秒出招 {_n} 次（{_gap}；设定冷却 {_cd:.2f}s；"
+                f"出招时攻击框内 {_eng} 个目标）{_tail}")
+        except Exception as _e:                               # noqa: BLE001
+            logger.info(f"[出招] 心跳统计失败：{_e!r}")
+        finally:
+            # 失败了也要清账：否则失败一次就永远重复报同一批数字
+            self._atk_n = 0
+            self._atk_gap_n = 0
+            self._atk_gap_sum = 0.0
+            self._atk_gap_min = None
+            self._atk_gap_max = 0.0
+            self._atk_eng_min = None
+            self._atk_eng_max = 0
+
+    def _log_monster_detect(self, engage, far):
+        '''
+        纯观测：把**这一帧的怪检测结果**写成一行 `[怪检测] …`（2026-10-14 加）。
+
+        由来（用户 m06852「记录下怪物的检测信息，现在的攻击还是不够灵敏」）：
+            `[运行状态]` 里只有「怪N」—— 看不出怪在**哪**、离攻击框差**多少**、
+            引擎认为角色在哪，于是"够不够灵敏"既没法证、也没法调。这一行补上：
+            攻击框绝对坐标 + 角色位置 + 每只怪的中心/尺寸/交叠/中心离框多远。
+
+        节流：① 攻击框内那批怪的**指纹变了**且距上次 >= 1s ⇒ 立刻打（"刚进框"
+                 正是最需要看清的时刻）；② 否则 >= 5s 打一次（连续但低调）。
+        开关：`monster_detect.detect_log`（默认开；false 关掉这一行）。
+        ⚠️ 纯观测：异常只吼一次，绝不影响判定/挂机。
+        '''
+        try:
+            _now = time.time()
+            if not bool((self.cfg.get("monster_detect") or {}).get("detect_log", True)):
+                return
+            _eng = list(engage or [])
+            _far = list(far or [])
+            _sig = tuple(sorted((int(_m["position"][0]), int(_m["position"][1]))
+                                for _m in _eng if _m.get("position")))
+            _t0 = float(getattr(self, "t_detect_log", 0.0) or 0.0)
+            _changed = _sig != getattr(self, "_det_log_sig", None)
+            if not ((_changed and _now - _t0 >= 1.0) or (_now - _t0 >= 5.0)):
+                return
+            self.t_detect_log = _now
+            self._det_log_sig = _sig
+            try:
+                # ★ 与判定同一个框（含 mob_engage_margin）—— 这一行的"中心在框内"
+                #   必须和引擎真的怎么判的一致，否则日志会撒谎。
+                _r = self._attack_boxes()[0]
+                _box = (int(_r[0]), int(_r[1]), int(_r[2]), int(_r[3]))
+            except Exception:                                  # noqa: BLE001
+                _box = None
+            _text = monster_detect_snapshot(
+                _eng, _far, box=_box, mode=self._engage_mode(),
+                need=self._min_mob_area(), detail_n=4,
+                margin=self._engage_margin(),
+                player=getattr(self, "loc_player", None))
+            logger.info(f"[怪检测] {_text}")
+        except Exception as _e:                                # noqa: BLE001
+            if not getattr(self, "_det_log_failed", False):
+                self._det_log_failed = True
+                logger.warning(
+                    f"[怪检测] 明细行生成失败：{_e!r} —— 不影响挂机（只吼这一次）。")
+
+    def _mob_no_attack_log(self, kind, **facts):
+        '''
+        `[没出招·归因]` 一行说清"**画面上有怪、这一帧却没出招**"的原因（2026-10-14 加）。
+
+        由来（用户真机反馈 m05740「有检测框、也在攻击范围内，但是没有立马攻击」）：
+          引擎里"没出招"有整整 6 条 `return` 路径（回正线 / 绳梯让路 / 攻击框外 /
+          锁定补招冷却 / directional 方向判不出 / 窗口不在前台），每条都合理、也各有
+          各的日志，但**没有任何一处把它们和"画面上的框"对上** —— 用户只能看到框，
+          看不到"引擎认为够不着"。本函数只做一件事：把本帧的事实汇总成一行。
+
+        ⚠️ 纯观测：**不参与任何判定**，也不改任何 cmd_*。删掉它行为完全不变。
+        ⚠️ 只在 `self.monsters` 非空时说话（画面上一个怪都没有 ⇒ 不出招是**正常**的，
+           不刷屏）。
+        ⚠️ 5 秒节流（与 `[绳/梯]` 同款）：避免把日志刷爆（`verify_log_no_flood` 盯着）。
+        ⚠️ 前台判据放在**节流之后**：`is_game_window_active()` 每调一次都要打 win32 API，
+           不能每帧调。
+        ⚠️ `kind='front'` 是"只在真的不在前台时才说"的：前台正常 ⇒ 直接返回，
+           **不消费节流**（否则真·不出的原因会被这一行挤掉）。
+
+        Args:
+            kind (str): 交给 mob_no_attack_reason 的归因类别。
+            **facts: 覆盖项（engage_n / far_n / front / cooldown_left 等），
+                缺的由这里补齐（攻击框半宽半高、两个开关、前台）。
+        '''
+        if not getattr(self, "monsters", None):
+            return
+        _now = time.time()
+        if _now - float(getattr(self, "t_mob_noatk_log", 0.0)) < 5.0:
+            return
+        if "front" not in facts:
+            facts["front"] = self._game_window_front()
+        if kind == "front" and facts.get("front") is not False:
+            return                                            # 前台正常/未知 ⇒ 不消费节流
+        # ⚠️ **先记账、再凑事实**：下面任何一步出意外，也不许变成"每帧刷一行"
+        #    （纯观测代码的底线：既不能带崩主循环，也不能把日志刷爆）
+        self.t_mob_noatk_log = _now
+        try:
+            _hx, _hy = self._attack_box_half()
+            facts.setdefault("half_x", _hx)
+            facts.setdefault("half_y", _hy)
+            if "engage_n" not in facts:
+                try:
+                    facts["engage_n"] = len(self._mobs_in_attack_box())
+                except Exception:                             # noqa: BLE001
+                    facts["engage_n"] = 0
+            facts.setdefault("far_n",
+                             max(0, len(self.monsters) - int(facts["engage_n"])))
+            _md = (self.cfg or {}).get("monster_detect") or {}
+            facts.setdefault("approach", bool(_md.get("approach_mob", True)))
+            facts.setdefault("stop_to_attack", bool(_md.get("stop_to_attack", True)))
+            _code, _text = mob_no_attack_reason(kind, **facts)
+        except Exception as e:                                # noqa: BLE001
+            # 失败绝不静默（`03 §6` 教训 4）：出错就直说，并且只吼一次/5s
+            logger.info(f"[没出招·归因] 归因文案生成失败：{e!r}")
+            return
+        logger.info(f"[没出招·归因] {_text}")
+
+    def _pick_approach_target(self, far_mobs, now=None):
+        '''从"看得见但够不着"的怪里挑一个来追 —— 带**出现确认**与**方向最小保持**。
+
+        2026-10-14（低频识别优化 P1，用户 m05009「落地」）加，治真机日志
+        （MSBot_2026-10-14_10-03-15.log 的 11:02 段）里看得见的两件事：
+          ① **幻影目标**：单帧匹配偶尔会在别处认出一个假目标，老口径"看见一帧就追"
+             会让角色为一个不存在的目标横着走几百像素。现在要求"连续两次采样都
+             看见够得着的远处怪"（两次间隔 ≤ `approach_confirm_s`）才算真看见。
+          ② **左右抖动**：日志里 `[靠近] …left 侧 323px` / `right 侧 282px` 每隔
+             几秒换一次边 —— 两只怪离得差不多远时，"最近的那只"每帧都可能换人，
+             角色就来回抽方向。现在方向至少保持 `approach_dir_min_s` 秒；
+             只有老方向那侧**一只怪都没有**时才允许提前掉头。
+
+        ⚠️ 只约束"追"，不约束"停下打"：停下的代价小（原地站一下）而且必须敏捷，
+           所以那一侧仍旧看一帧就算（见 `update_cmd_by_mob_detection`）。
+        ⚠️ 跨层的怪（|dy| > approach_dy_tol）照旧不追 —— 与老口径一致。
+        ⚠️ 同一帧内可能被调用两次（`_holding` 的追怪分支 + `if not _engage` 的
+           靠近分支，directional 下两者都会走到）⇒ 计数用 `_approach_count_t`
+           防重复，否则"连续两次采样"会被同一帧凑齐。
+
+        Args:
+            far_mobs (list): 看得见但不在攻击框里的那批怪（调用方算好）
+            now (float | None): 本帧的时刻（调用方传 `update_cmd_by_mob_detection`
+                里的 `_now`）。⚠️ 不能在这里各自 `time.time()` —— 同一帧内本函数会被
+                调用两次（追怪 + 靠近），两次的时间戳差几微秒，就会绕过"同一帧只数一次
+                采样"的防重复，让**一帧**凑齐"连续两次确认"（幻影目标立刻被追）。
+
+        Returns:
+            (str | None, int | None, int | None):
+                (方向 'left'/'right', 该侧最近目标的曼哈顿距离, 它的高差 dy)
+                没得追 / 还没确认 ⇒ (None, None, None)
+        '''
+        _md = self.cfg.get("monster_detect") or {}
+        try:
+            _dy_tol = int(_md.get("approach_dy_tol", 60) or 0)
+        except (TypeError, ValueError):
+            _dy_tol = 60
+        try:
+            _confirm_s = float(_md.get("approach_confirm_s", 0.5) or 0.0)
+        except (TypeError, ValueError):
+            _confirm_s = 0.5
+        try:
+            _dir_min_s = float(_md.get("approach_dir_min_s", 0.4) or 0.0)
+        except (TypeError, ValueError):
+            _dir_min_s = 0.4
+        _now = float(now) if now is not None else time.time()
+        _px, _py = self.loc_player[0], self.loc_player[1]
+        _cands = []
+        for _m in far_mobs or []:
+            try:
+                _mx, _my = _m["position"]
+                _mw, _mh = _m["size"]
+            except (KeyError, TypeError):
+                continue
+            _cx, _cy = _mx + _mw // 2, _my + _mh // 2
+            if abs(_cy - _py) > _dy_tol:
+                continue                       # 跨层：交给路线，不横着硬走
+            _cands.append((_cx, _cy, abs(_cx - _px) + abs(_cy - _py)))
+        if not _cands:
+            return None, None, None
+        # ── ① 出现确认：连续两次**采样**都看见远处有够得着的怪才算数 ──────────
+        #    ⚠️ `approach_confirm_s: 0`（或负）= **关掉**这道防抖，逐字退回老口径
+        #       「看见一帧就追」—— 与 `target_hold_s: 0` 的约定一致（0 = 关）。
+        #       所以 ① 整段必须包在 `if _confirm_s > 0` 里，不能只靠"两次间隔 ≤ 0"
+        #       去凑：第一帧的计数天生是 1，那样"关掉"也会少追一帧。
+        if _confirm_s > 0.0:
+            if _now - float(getattr(self, "_approach_count_t", 0.0) or 0.0) > 0.001:
+                self._approach_count_t = _now
+                if _now - float(getattr(self, "_approach_seen_t", 0.0) or 0.0) <= _confirm_s:
+                    self._approach_n = int(getattr(self, "_approach_n", 0)) + 1
+                else:
+                    self._approach_n = 1
+                self._approach_seen_t = _now
+            if int(getattr(self, "_approach_n", 0)) < 2:
+                return None, None, None        # 只认到一帧 —— 可能是幻影，等下次采样
+        _cx, _cy, _dist = min(_cands, key=lambda _c: _c[2])
+        _dir = "right" if _cx >= _px else "left"
+        # ── ② 方向最小保持：老方向那侧还有怪就不许掉头（治左右抖动）──────────
+        _old = getattr(self, "_approach_dir", None)
+        _old_t = float(getattr(self, "_approach_dir_t", 0.0) or 0.0)
+        if _old and _dir != _old and _now - _old_t < _dir_min_s:
+            _same = [_c for _c in _cands if ((_c[0] >= _px) == (_old == "right"))]
+            if _same:
+                _dir = _old
+                _cx, _cy, _dist = min(_same, key=lambda _c: _c[2])
+        if _old != _dir:
+            self._approach_dir = _dir
+            self._approach_dir_t = _now
+        return _dir, int(_dist), int(_cy - _py)
+
     def get_nearest_monster(self, is_left=True):
         '''
         Finds the nearest monster within the player's attack range.
@@ -1620,12 +3054,10 @@ class MapleStoryAutoBot:
             ih = max(0, iy2 - iy1)
             inter_area = iw * ih
 
-            # 取所有怪物模板中最小的面积作下限；空模板时退回 0，
-            # 避免对空序列 min() 抛 ValueError（与 with_enemy_hp_bar 处同样的埋雷）
-            _areas = [im.shape[0] * im.shape[1]
-                      for _, _imgs in self.monsters_info.items() for im, _ in _imgs]
-            min_mob_area = min(_areas) if _areas else 0
-            inter_area_thres = min(min_mob_area, self.cfg['monster_detect']['max_mob_area_trigger'])
+            # 交叠面积下限：与 `_mobs_in_attack_box` 共用同一个 helper
+            # （原来是就地算一遍：空模板退回 0，避免对空序列 min() 抛 ValueError。
+            #   抽出去是为了两处口径永不漂移 —— "改一处漏一处"是本项目的常见故障形态）
+            inter_area_thres = self._min_mob_area()
             if inter_area >= inter_area_thres:
                 # Compute distance to player center
                 monster_center = (mx1 + mw // 2, my1 + mh // 2)
@@ -1638,6 +3070,116 @@ class MapleStoryAutoBot:
                     nearest_monster = monster
 
         return nearest_monster
+
+    # ── 怪物模板的「前景色校验闸」（2026-10-13 加）─────────────────────────────
+    # 为什么要这一闸：
+    #   contour_only 模式**只看黑色轮廓**（`np.all(img == [0,0,0])`），把怪的颜色
+    #   信息整个丢掉了。实测（2026-10-13，沼泽地2 真帧，画面里**没有**鳄鱼）：
+    #   diff_thres=0.4 下检出 **17 个框，全部落在平台植被上**（分数 0.359~0.3997），
+    #   而正确结果应当是 0 个 —— 植被的黑色轮廓密度/走向和怪足够像，轮廓分数分不开。
+    # 判据：
+    #   拿模板里**真正的怪像素**（前景 = 不是绿幕 (0,255,0) 的像素；绿幕是本项目
+    #   截模板工具画的背景色）逐点比对画面同位置的像素：
+    #   逐通道最大差 <= verify_color_tol 的前景像素占比 >= verify_min_ratio 才算命中。
+    # 标定（同一批真帧 + 把真模板贴到平台上的合成"真怪"）：
+    #   假框通过率 0.33~0.63（前景色差中位数 34）；合成真怪通过率 1.00（色差 0）
+    #   ⇒ 默认 tol=30 / ratio=0.75 挡掉全部 17 个假框，真怪一个不少。
+    # ⚠️ 前景 = 不是纯绿 (0,255,0) 的像素。本工具截的模板用绿幕当透明底，
+    #    所以前景正好是"怪自己的像素"；没有绿幕的合成/旧模板，前景就退化成
+    #    "全部像素"，等价于逐像素色校验 —— 只要画面里原样贴着这张模板就照样通过
+    #    （既有自检的合成夹具就是这么造的，行为不变）。
+    @staticmethod
+    def _mob_scales(md_cfg):
+        '''解析 `monster_detect.scales`（多尺度模板匹配）。
+
+        · 默认 `[1.0]` ⇒ 与"没有这个键"完全一致（调用方对 1.0 不做 resize）。
+        · 官方素材与游戏内渲染尺寸对不上时配多个比例
+          （参考项目 zhoufanglu/maplestory-auto-ds 的推荐值 `[0.7, 0.85, 1.0, 1.15]`）。
+        · ⚠️ 代价 ≈ 匹配耗时 × 尺度数（2026-10-13 真机标定：单尺度 66.7~69.6 ms/帧）。
+        · fail-closed：非法值逐条丢掉 + warning；**全丢光回退 `[1.0]`**
+          （宁可退化成老行为，也不让整套模板因为一个键写错而加载不出来）。
+        '''
+        raw = (md_cfg or {}).get("scales") or [1.0]
+        if isinstance(raw, (int, float)) or not isinstance(raw, (list, tuple)):
+            logger.warning(f"[怪物] monster_detect.scales 必须是列表，收到 {raw!r} ⇒ 回退 [1.0]")
+            return [1.0]
+        out = []
+        for s in raw:
+            try:
+                s = float(s)
+            except (TypeError, ValueError):
+                logger.warning(f"[怪物] scales 里的 {s!r} 不是数字，已忽略")
+                continue
+            if not (0.0 < s <= 10.0):
+                logger.warning(f"[怪物] scales 里的 {s} 超出 (0, 10] 范围，已忽略")
+                continue
+            if s not in out:
+                out.append(s)
+        if not out:
+            logger.warning("[怪物] scales 里没有一个可用值 ⇒ 回退 [1.0]（单尺度）")
+            return [1.0]
+        return sorted(out)
+
+    @staticmethod
+    def _mob_template_variants(img, scales):
+        '''一张模板 → 每个尺度 + 左右镜像的 `(图, 前景掩码)` 列表。
+
+        · `scale == 1.0` **不做 resize**（保证默认配置下与"没有多尺度"逐像素一致）。
+        · 缩放用 `INTER_NEAREST`：contour_only 的输入是硬边黑白轮廓，
+          线性插值会糊掉边界（参考项目同款做法）。
+        · 掩码口径只有一处：`get_mask(img, (0, 255, 0))`（= 绿幕以外都是前景）。
+        '''
+        out = []
+        h, w = img.shape[:2]
+        for s in scales:
+            if s == 1.0:
+                v = img
+            else:
+                v = cv2.resize(img, (max(1, int(round(w * s))), max(1, int(round(h * s)))),
+                               interpolation=cv2.INTER_NEAREST)
+            out.append((v, get_mask(v, (0, 255, 0))))
+            v_flip = cv2.flip(v, 1)
+            out.append((v_flip, get_mask(v_flip, (0, 255, 0))))
+        return out
+
+    @staticmethod
+    def _mob_hit_points(res, diff_thres, cap=50):
+        '''模板匹配结果里 `<= diff_thres` 的命中点 → 至多 `cap` 个，按分数从好到坏。
+
+        ⚠️ 为什么要封顶（2026-10-13 借参考项目 maplestory-auto-ds 的 50 上限）：
+            `TM_SQDIFF_NORMED` 在**平坦画面**（全黑帧、大片同色地面）上会让成千上万个
+            位置都满足阈值。原实现把它们全部收进列表，再逐点过颜色校验闸、最后做
+            O(n²) 的 NMS —— 一帧就能把界面卡死，而症状是"卡住了"、不是报错。
+        返回：(x, y) 的迭代器（顺序与原来的 `zip(*np.where(...)[::-1])` 一致）。
+        '''
+        ys, xs = np.where(res <= diff_thres)
+        if len(xs) <= cap:
+            return zip(xs.tolist(), ys.tolist())
+        best = np.argsort(res[ys, xs])[:cap]      # SQDIFF：越小越像
+        return zip(xs[best].tolist(), ys[best].tolist())
+
+    # ⚠️ 形状对不上、前景为空一律**放行**：这里宁可能多认，也不静默漏怪。
+    @staticmethod
+    def _mob_foreground_mask(templ):
+        '''模板的「前景」掩码 = 不是纯绿 (0,255,0) 的像素（见上面的说明）。
+
+        返回 None 只在"整张模板都是绿幕"（空模板）时发生 ⇒ 调用方不做色校验。
+        '''
+        # 与模板加载同口径：`tools/verify_monster.py:67` 也是 `get_mask(img, (0,255,0))`
+        # ⇒ "什么算透明"只有一处定义（src/utils/common.py:575），不再各写一份。
+        fg = get_mask(templ, (0, 255, 0)).astype(bool)
+        return fg if bool(fg.any()) else None
+
+    @staticmethod
+    def _mob_color_ok(patch, templ, fg, tol, min_ratio):
+        '''画面候选框 patch 与模板 templ 的前景色是否足够一致（见上面的说明）。'''
+        if patch.size == 0 or patch.shape[:2] != templ.shape[:2]:
+            return True
+        n = int(fg.sum())
+        if n == 0:
+            return True
+        diff = np.abs(patch.astype(np.int16) - templ.astype(np.int16)).max(axis=2)
+        return float((diff[fg] <= tol).mean()) >= min_ratio
 
     def get_monsters_in_range(self, top_left, bottom_right):
         '''
@@ -1660,6 +3202,14 @@ class MapleStoryAutoBot:
         char_y_max = min(img_roi.shape[0], py_in_roi + self.cfg["character"]["height"] // 2)
 
         monsters = []
+        # 前景色校验闸的参数（2026-10-13 加，判据与标定见 _mob_color_ok 的说明）
+        # ⚠️ 一律 .get(...) 取：自检脚本里的桩 cfg 往往只写少数几个键（见
+        #    tools/verify_mob_boxes.py / verify_two_side_mob_attack.py），
+        #    直接下标会 KeyError 把既有自检全带崩。
+        _md_cfg = self.cfg.get("monster_detect") or {}
+        _verify_color = bool(_md_cfg.get("verify_color", True))
+        _color_tol = int(_md_cfg.get("verify_color_tol", 30))
+        _min_ratio = float(_md_cfg.get("verify_min_ratio", 0.75))
         # ── contour_only 模式：ROI 侧的预处理**整帧只做一次**（2026-09-14 优化）──
         # ⚠️ 原来这几行放在下面的模板循环里 → 同一张 ROI 被重复处理 N 遍
         #    （N = 模板数量，本图 4 种怪共约 20 张）。实测怪检测一帧要 ~490ms，
@@ -1692,52 +3242,143 @@ class MapleStoryAutoBot:
                     h_temp, w_temp = img_monster_blur.shape[:2]
 
                     if h_temp > h_roi or w_temp > w_roi:
-                        return []  # template bigger than roi, skip this matching
+                        # ⚠️★ 2026-10-13 修：原来这里是 `return []` —— 一张比搜索框大的
+                        #    模板会让**整帧**的怪检测当场作废：已经找到的怪全被丢掉，
+                        #    后面还没跑的模板也一个都不跑。而"模板比搜索框大"只是这一张
+                        #    不能用而已（攻击范围小、或怪贴着搜索框边界时很常见）。
+                        #    这又是一处**静默**失效：日志只字不提，用户只看到"怪认不出来"。
+                        logger.debug(
+                            f"[怪物] 模板 {monster_name} {w_temp}x{h_temp} 比搜索框 "
+                            f"{w_roi}x{h_roi} 大，跳过这一张（不影响其它模板）")
+                        continue
+
+                    # 太小的模板（<10px）直接跳过：匹配没意义，多半是坏素材
+                    # （判据借参考项目 maplestory-auto-ds 的 `tw<10 or th<10`）
+                    if h_temp < 10 or w_temp < 10:
+                        logger.debug(f"[怪物] 模板 {monster_name} {w_temp}x{h_temp} 太小"
+                                     f"（<10px），跳过这一张")
+                        continue
 
                     # Perform template matching
-                    res = cv2.matchTemplate(img_roi_blur, img_monster_blur, cv2.TM_SQDIFF_NORMED)
+                    try:
+                        res = cv2.matchTemplate(img_roi_blur, img_monster_blur,
+                                                cv2.TM_SQDIFF_NORMED)
+                    except cv2.error as e:
+                        # 单张模板匹配失败不该作废整帧（不静默：debug 日志带原因）
+                        logger.debug(f"[怪物] 模板 {monster_name} 匹配失败，跳过这一张：{e}")
+                        continue
 
                     # Apply soft threshold
-                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                    match_locations = self._mob_hit_points(
+                        res, self.cfg["monster_detect"]["diff_thres"])
 
                     h, w = img_monster.shape[:2]
-                    for pt in zip(*match_locations[::-1]):
+                    _fg = self._mob_foreground_mask(img_monster) if _verify_color else None
+                    for pt in match_locations:
+                        if _fg is not None and not self._mob_color_ok(
+                                img_roi[pt[1]:pt[1] + h, pt[0]:pt[0] + w],
+                                img_monster, _fg, _color_tol, _min_ratio):
+                            continue
                         monsters.append({
                             "name": monster_name,
                             "position": (pt[0] + x0, pt[1] + y0),
-                            "size": (h, w),
+                            # ⚠️ (宽, 高)——**不是** (高, 宽)：全仓库 11 处消费点
+                            #    （`mw, mh = monster["size"]`、绿框绘制、锁定中心
+                            #    `position[0] + size[0]//2`）都按 (宽, 高) 读。
+                            #    2026-10-14 修：这里原来写 `(h, w)`，等于把每个怪的
+                            #    判定框宽高**对调**（青蛇 31h×28w ⇒ 横向多 3px、
+                            #    纵向少 3px），"够得着"的判定与画出来的绿框都跟着偏。
+                            "size": (w, h),
                             "score": res[pt[1], pt[0]],
                         })
                 elif self.cfg["monster_detect"]["mode"] == "grayscale":
+                    # 尺寸闸（2026-10-13 补）：模板比 ROI 大时 cv2.matchTemplate 会**抛异常**，
+                    #   而 grayscale/color 这两个分支原来**没有**这道闸（只有 contour_only 有）
+                    #   ⇒ 一张大模板足以让整帧怪检测崩掉。
+                    _h_roi, _w_roi = img_roi.shape[:2]
+                    _h_temp, _w_temp = img_monster.shape[:2]
+                    if _h_temp > _h_roi or _w_temp > _w_roi:
+                        logger.debug(
+                            f"[怪物] 模板 {monster_name} {_w_temp}x{_h_temp} 比搜索框 "
+                            f"{_w_roi}x{_h_roi} 大，跳过这一张（不影响其它模板）")
+                        continue
+                    if _h_temp < 10 or _w_temp < 10:
+                        logger.debug(f"[怪物] 模板 {monster_name} {_w_temp}x{_h_temp} 太小"
+                                     f"（<10px），跳过这一张")
+                        continue
                     img_monster_gray = cv2.cvtColor(img_monster, cv2.COLOR_BGR2GRAY)
                     img_roi_gray = cv2.cvtColor(img_roi, cv2.COLOR_BGR2GRAY)
-                    res = cv2.matchTemplate(
-                            img_roi_gray,
-                            img_monster_gray,
-                            cv2.TM_SQDIFF_NORMED,
-                            mask=mask_monster)
-                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                    try:
+                        res = cv2.matchTemplate(
+                                img_roi_gray,
+                                img_monster_gray,
+                                cv2.TM_SQDIFF_NORMED,
+                                mask=mask_monster)
+                    except cv2.error as e:
+                        logger.debug(f"[怪物] 模板 {monster_name} 匹配失败，跳过这一张：{e}")
+                        continue
+                    match_locations = self._mob_hit_points(
+                        res, self.cfg["monster_detect"]["diff_thres"])
                     h, w = img_monster.shape[:2]
-                    for pt in zip(*match_locations[::-1]):
+                    _fg = self._mob_foreground_mask(img_monster) if _verify_color else None
+                    for pt in match_locations:
+                        if _fg is not None and not self._mob_color_ok(
+                                img_roi[pt[1]:pt[1] + h, pt[0]:pt[0] + w],
+                                img_monster, _fg, _color_tol, _min_ratio):
+                            continue
                         monsters.append({
                             "name": monster_name,
                             "position": (pt[0] + x0, pt[1] + y0),
-                            "size": (h, w),
+                            # ⚠️ (宽, 高)——**不是** (高, 宽)：全仓库 11 处消费点
+                            #    （`mw, mh = monster["size"]`、绿框绘制、锁定中心
+                            #    `position[0] + size[0]//2`）都按 (宽, 高) 读。
+                            #    2026-10-14 修：这里原来写 `(h, w)`，等于把每个怪的
+                            #    判定框宽高**对调**（青蛇 31h×28w ⇒ 横向多 3px、
+                            #    纵向少 3px），"够得着"的判定与画出来的绿框都跟着偏。
+                            "size": (w, h),
                             "score": res[pt[1], pt[0]],
                     })
                 elif self.cfg["monster_detect"]["mode"] == "color":
-                    res = cv2.matchTemplate(
-                            img_roi,
-                            img_monster,
-                            cv2.TM_SQDIFF_NORMED,
-                            mask=mask_monster)
-                    match_locations = np.where(res <= self.cfg["monster_detect"]["diff_thres"])
+                    # 尺寸闸同上（color 分支原来也没有）
+                    _h_roi, _w_roi = img_roi.shape[:2]
+                    _h_temp, _w_temp = img_monster.shape[:2]
+                    if _h_temp > _h_roi or _w_temp > _w_roi:
+                        logger.debug(
+                            f"[怪物] 模板 {monster_name} {_w_temp}x{_h_temp} 比搜索框 "
+                            f"{_w_roi}x{_h_roi} 大，跳过这一张（不影响其它模板）")
+                        continue
+                    if _h_temp < 10 or _w_temp < 10:
+                        logger.debug(f"[怪物] 模板 {monster_name} {_w_temp}x{_h_temp} 太小"
+                                     f"（<10px），跳过这一张")
+                        continue
+                    try:
+                        res = cv2.matchTemplate(
+                                img_roi,
+                                img_monster,
+                                cv2.TM_SQDIFF_NORMED,
+                                mask=mask_monster)
+                    except cv2.error as e:
+                        logger.debug(f"[怪物] 模板 {monster_name} 匹配失败，跳过这一张：{e}")
+                        continue
+                    match_locations = self._mob_hit_points(
+                        res, self.cfg["monster_detect"]["diff_thres"])
                     h, w = img_monster.shape[:2]
-                    for pt in zip(*match_locations[::-1]):
+                    _fg = self._mob_foreground_mask(img_monster) if _verify_color else None
+                    for pt in match_locations:
+                        if _fg is not None and not self._mob_color_ok(
+                                img_roi[pt[1]:pt[1] + h, pt[0]:pt[0] + w],
+                                img_monster, _fg, _color_tol, _min_ratio):
+                            continue
                         monsters.append({
                             "name": monster_name,
                             "position": (pt[0] + x0, pt[1] + y0),
-                            "size": (h, w),
+                            # ⚠️ (宽, 高)——**不是** (高, 宽)：全仓库 11 处消费点
+                            #    （`mw, mh = monster["size"]`、绿框绘制、锁定中心
+                            #    `position[0] + size[0]//2`）都按 (宽, 高) 读。
+                            #    2026-10-14 修：这里原来写 `(h, w)`，等于把每个怪的
+                            #    判定框宽高**对调**（青蛇 31h×28w ⇒ 横向多 3px、
+                            #    纵向少 3px），"够得着"的判定与画出来的绿框都跟着偏。
+                            "size": (w, h),
                             "score": res[pt[1], pt[0]],
                     })
                 else:
@@ -2148,20 +3789,20 @@ class MapleStoryAutoBot:
             draw_rectangle(
                 self.img_frame_debug, (x0, y0),
                 (y1-y0, x1-x0),
-                (0, 0, 255), "攻击范围"
+                (0, 0, 255), "攻击框（打得到）蓝框=索敌框（只看不打）"
             )
         elif self.cfg["bot"]["attack"] == "directional":
             x0, y0, x1, y1 = self.get_attack_range(is_left=True)
             draw_rectangle(
                 self.img_frame_debug, (x0, y0),
                 (y1-y0, x1-x0),
-                (0, 0, 255), "攻击范围(左)"
+                (0, 0, 255), "攻击框(左)蓝框=索敌框(只看不打)"
             )
             x0, y0, x1, y1 = self.get_attack_range(is_left=False)
             draw_rectangle(
                 self.img_frame_debug, (x0, y0),
                 (y1-y0, x1-x0),
-                (0, 0, 255), "攻击范围(右)"
+                (0, 0, 255), "攻击框(右)"
             )
 
         # ── 逐怪画框（2026-09-29 加回，**默认开**）─────────────────────────────
@@ -2241,19 +3882,18 @@ class MapleStoryAutoBot:
         if self.img_frame_debug is not None and \
                 (self.cfg.get("monster_detect", {}) or {}).get("draw_mob_boxes", False):
             try:
-                _md = self.cfg["monster_detect"]
-                _margin = _md["search_box_margin"]
-                if self.cfg["bot"]["attack"] == "aoe_skill":
-                    _dx = self.cfg["aoe_skill"]["range_x"] // 2 + _margin
-                    _dy = self.cfg["aoe_skill"]["range_y"] // 2 + _margin
-                else:
-                    _dx = self.cfg["directional_attack"]["range_x"] + _margin
-                    _dy = self.cfg["directional_attack"]["range_y"] + _margin
+                # ⚠️★ 2026-10-13：改成调**怪检测用的同一个函数** get_search_box()。
+                #    原因：本轮给索敌框加了 detect_range_scale（放大）与"位置丢了
+                #    就放到整帧"，画框那边如果继续就地重算，就会画出一个**跟检测
+                #    实际用的框不一样**的框 —— 用户按画面上那个框去判断"为什么没
+                #    认出怪"，会被彻底带偏（比不画还糟）。纯函数性质从此由
+                #    "同一份代码"保证，不再靠注释里的论证。
                 _h_f, _w_f = self.img_frame_debug.shape[:2]
-                _sx0 = max(0, self.loc_player[0] - _dx)
-                _sx1 = min(_w_f, self.loc_player[0] + _dx)
-                _sy0 = max(0, self.loc_player[1] - _dy)
-                _sy1 = min(_h_f, self.loc_player[1] + _dy)
+                _sx0, _sy0, _sx1, _sy1 = self.get_search_box()
+                # 2026-10-14：**不给索敌框加中文标签** —— 用户分不清"哪个框才打得
+                #   到"的问题改由**攻击框的标签**解决（见上面 "攻击框（打得到）
+                #   蓝框=索敌框（只看不打）"）。理由：中文标签要走 PIL，每帧多一次
+                #   图像往返会拖帧，这条由 tools/verify_mob_boxes.py 钉着。
                 cv2.rectangle(self.img_frame_debug,
                               (_sx0, _sy0), (_sx1, _sy1), (255, 0, 0), 2)
             except Exception:                                # noqa: BLE001
@@ -2324,6 +3964,12 @@ class MapleStoryAutoBot:
         # Terminate game window capturor
         if self.capture is not None:
             self.capture.stop()
+        # 示范录制收尾（2026-10-14 加）：关文件 + 停按键监听（纯观测，出错不影响退出）
+        if getattr(self, "demo", None) is not None:
+            try:
+                self.demo.stop()
+            except Exception as _e:                           # noqa: BLE001
+                logger.warning(f"[示范录制] 停止时出错：{_e!r}")
         self.is_terminated = True
         logger.info(f"[terminate_threads] Terminated all threads")
 
@@ -2460,18 +4106,25 @@ class MapleStoryAutoBot:
         # 攻击方向的选择结果会体现在日志 [运行状态] 的指令里。
         return attack_direction
 
-    def get_face_direction(self):
+    def get_face_direction(self, monsters=None):
         '''
         离玩家最近的怪在玩家的哪一侧（"left" / "right" / None）。
 
         只用于让角色**面向**目标（AOE 模式）—— 与 get_attack_direction 不同：
         后者在两边怪距离接近时会返回 None（避免乱打），但**朝向**总得选一个，
         不能因为取舍不定就让角色一直保持初始朝向。
+
+        Args:
+            monsters: 参与判定的怪列表；默认 `self.monsters`（全部检测结果）。
+                2026-10-13 加：感知框放大后 self.monsters 里会混进**够不着**的远处怪，
+                AOE 分支改成传 `_mobs_in_attack_box()` 的结果 —— 否则角色会对着一只
+                够不着的远端怪转身，把近处这只打偏。
         '''
-        if not self.monsters:
+        monsters = self.monsters if monsters is None else monsters
+        if not monsters:
             return None
         best_x, best_d = None, float('inf')
-        for monster in self.monsters:
+        for monster in monsters:
             mx, my = monster["position"]
             mw, mh = monster["size"]
             cx, cy = mx + mw // 2, my + mh // 2
@@ -2590,6 +4243,17 @@ class MapleStoryAutoBot:
         # 切回**最近的那一段**主线（多段巡逻时不能切回上一段，会往回走）
         seg = self._main_seg_i
         if seg is not None and 0 <= int(seg) < len(self.img_routes):
+            # ★ 2026-10-14：这里是**唯一会跨段跳**的地方 —— 退出回正线时直接切到
+            #   「离角色最近的那一段」（可能一次跳好几段，用户看到的就是"段号跳"）。
+            #   原来只在 `_exit_home_route` 的 reason 里带一句"（第 N/M 段）"，
+            #   找起来费劲；现在只要段号真的变了就单打一行 `[切段]`，
+            #   与新加的推进切段日志同前缀，grep `[切段]` 就能看全部段号变化。
+            if int(seg) != self.idx_routes:
+                logger.info(
+                    f"[切段] 退出回正线 → 切到**离角色最近的那一段**："
+                    f"第 {self.idx_routes + 1}/{len(self.img_routes)} 段 → "
+                    f"第 {int(seg) + 1}/{len(self.img_routes)} 段"
+                    f"（全局 {tuple(self.loc_player_global) if self.loc_player_global else None}）")
             self.idx_routes = int(seg)
             self.img_route = self.img_routes[int(seg)]
         # 走统一出口（它会清掉 home_* 那一组跨帧状态 + 重新武装这条线）
@@ -4045,13 +5709,43 @@ class MapleStoryAutoBot:
                 #     · 回正期间不打怪 → 「既不走也不打」的 QA-20 死局原样复活。
                 #   加了这道闸后：没有可用回正线 = 站着不动、由打怪逻辑接管（有出口）。
                 _d_far, _ln = self._home_dist()
-                if _ln is not None:
+                # ★ ③（2026-10-14，用户 m09666 拍板）：**可达性闸** —— 只看"有没有
+                #  这条线"是不够的：`_home_dist()` 量的是**全图**最近距离（跟
+                #  `_main_dist()` 一样刻意不受 search_range / rescue_range 限制），
+                #  而进来之后的路线搜索只有 search_range(10) / rescue_range(40) 的框
+                #  ⇒ 线在 48~80px 外时，进来必然"一个像素都搜不到"⇒ 同一帧走
+                #  `回正线接不上` 出口，还会**把这条线去武装**（要离开它的范围才重装）。
+                #  真机证据（`log/MSBot_2026-10-14_16-51-02.log`，465s）：`[回正·小结]`
+                #  8 条里 **6 条**是「0.0s/0帧 | 一次都没走到起跳点 | 离回正线
+                #  22/48/78/78/80/48px、离主线 0px」——就是这种"进得去、走不了"的空转，
+                #  它喂出了 14.2 次/分钟的 `[回正]`、3.4 次/分钟的 `[路线失联]`。
+                #  ⇒ 要求"最近的回正线像素落在搜索框够得着的范围内"才准进。
+                #  ⚠️ 半径口径必须与 `get_nearest_color_code()` 的救援半径**一致**
+                #     （那边 rescue 只在 > search_range 时才生效 ⇒ 这里照抄同一条判据），
+                #     否则又是一处"改一处漏一处"。
+                _reach = self.cfg["route"].get("rescue_range", 40)
+                try:
+                    _reach = int(_reach)
+                except (TypeError, ValueError):
+                    _reach = 40
+                if _reach <= int(self.cfg["route"]["search_range"]):
+                    _reach = int(self.cfg["route"]["search_range"])
+                if _ln is not None and _d_far is not None and int(_d_far) <= _reach:
                     self._enter_home_route(
                         f"主线附近找不到路线（走丢了），离回正线 {_d_far}px", _ln)
                     if self.is_using_home_route:
                         _perf_t0 = time.perf_counter()
                         color_code, color_code_up_down = self.get_nearest_color_code()
                         self._perf("路线搜索", _perf_t0)
+                elif _ln is not None and time.time() - self.t_last_home_fail_log > 10:
+                    self.t_last_home_fail_log = time.time()
+                    logger.info(
+                        f"[回正] 有可用回正线，但最近像素在 {_d_far}px 外"
+                        f"（搜索 {self.cfg['route']['search_range']}px / "
+                        f"救援半径 {_reach}px 够不着）⇒ **不进去**：进去也搜不到像素、"
+                        f"当帧就会退出并把这条线去武装。\n"
+                        f"        先站着让打怪逻辑接管（有出口）；人走近这条线附近"
+                        f"会自动进去。")
             if color_code is None and color_code_up_down is None:
                 # ── 出口：回正线接不上 → 立刻退出回正状态（2026-09-12 加）────────────
                 # 「加开关必须加出口」。「回正期间不打怪」这个开关的前提是回正线能接上；
@@ -4258,8 +5952,37 @@ class MapleStoryAutoBot:
                 _up_x = color_code_up_down["pixel"][0]
                 _up_y = color_code_up_down["pixel"][1]
                 _can_check_fake = self.img_route_home is not None
+                # ★ 2026-10-14 追加（用户报「不上楼梯、从绳梯旁直接走过去」）：
+                #   判"真管柱"时**同时看当前段路线图**（`self.img_route`）。
+                #   旧版只看回正线 —— 废铁2 的 route_home.png 里竖向像素**只有
+                #   x=70..71 / y=80..88 这 9 个**，于是除那一列以外，凡是"up 像素
+                #   正好落在角色这一行"的真绳梯都被判成地面伪灰 ⇒ 引擎照抄横向
+                #   命令（right）⇒ 角色从绳梯脚下走过去、全程不按 up
+                #   （真机 17:22 场逐帧复刻：x=162..171 一路 right，直到 x=179
+                #   才轮到 up；而真绳梯就在 x=163）。
+                #   判据：同列 ±1px、上下 3px 内有"竖向色码"（up/down）= 真绳梯/管柱
+                #   —— 与 09-17 的原始设计一致（真管柱一定有连续竖向像素）。
+                #   取不到（桩不全 / 图不可用）就退回旧判断（fail-closed）。
+                _route_vert = False
+                try:
+                    _img_r = self.img_route
+                    if _can_check_fake and _up_y == self.loc_player_global[1] \
+                            and _img_r is not None:
+                        _vcodes = set(self.color_code_up_down.keys())
+                        for _ck, _cmdv in self.color_code.items():
+                            _p3v = str(_cmdv).split()
+                            if len(_p3v) == 3 and _p3v[1] in ("up", "down"):
+                                _vcodes.add(_ck)
+                        _rh, _rw = _img_r.shape[:2]
+                        _route_vert = any(
+                            tuple(int(v) for v in _img_r[_up_y-d, _up_x+dx][:3]) in _vcodes
+                            for dx in (-1, 0, 1) for d in (-3, -2, -1, 1, 2, 3)
+                            if 0 <= _up_y-d < _rh and 0 <= _up_x+dx < _rw)
+                except Exception:                                    # noqa: BLE001
+                    _route_vert = False
                 _fake = (_can_check_fake
                          and _up_y == self.loc_player_global[1]
+                         and not _route_vert
                          and (_up_y - 3 < 0
                               or not any(tuple(int(v) for v in self.img_route_home[_up_y-d, _up_x][:3])
                                           in {(127, 127, 127), (255, 255, 127)}
@@ -4271,8 +5994,31 @@ class MapleStoryAutoBot:
                     self.cmd_move_x, self.cmd_move_y, self.cmd_action = (
                         color_code_up_down["command"].split())
                     cmd, _, _ = color_code["command"].split()
-                    if self.cmd_move_x == "none" and self.is_on_ladder:
-                        self.cmd_move_x = cmd  # only complement cmd_move_x when player is on ladder
+                    if self.cmd_move_x == "none":
+                        if self.is_on_ladder:
+                            # 原有：真在爬 ⇒ 用路线的横向命令把角色稳在绳子上
+                            self.cmd_move_x = cmd  # only complement cmd_move_x when player is on ladder
+                        else:
+                            # ★ 2026-10-14 绳梯脚下"蹭一下"自救（用户拍板 D）——
+                            #   判据/方向/取值全在 `_rope_nudge_dir()` 与
+                            #   config_default.yaml 的 route.rope_nudge_* 长注释里；
+                            #   本块只负责"问一次 + 蹭 + 留痕"。
+                            _ud_cmd = color_code_up_down["command"].split()
+                            _nd = self._rope_nudge_dir(
+                                _up_x, _ud_cmd[1] if len(_ud_cmd) == 3 else "none")
+                            if _nd:
+                                self.cmd_move_x = _nd
+                                self._rope_nudge_n = int(
+                                    getattr(self, "_rope_nudge_n", 0)) + 1
+                                if time.time() - getattr(self, "t_rope_nudge_log", 0.0) > 1.5:
+                                    self.t_rope_nudge_log = time.time()
+                                    _age_ms = int((time.time() - float(
+                                        getattr(self, "t_ladder_move", 0.0) or 0.0)) * 1000)
+                                    logger.warning(
+                                        f"[绳梯自救] 路线要 {_ud_cmd[1]}、已经在绳梯脚下"
+                                        f"按了 {_age_ms}ms 没往上走 → 往 {_nd} 蹭一下"
+                                        f"（左右交替、up 一直按着；"
+                                        f"`route.rope_nudge_s` 填 0 = 关掉本层）")
         elif color_code:
             self.cmd_move_x, self.cmd_move_y, self.cmd_action = color_code["command"].split()
         elif color_code_up_down:
@@ -4368,23 +6114,195 @@ class MapleStoryAutoBot:
             f"指令({self.cmd_move_x} {self.cmd_move_y} {self.cmd_action})"
             + (f"，距上次 {gap:.2f}s" if gap is not None else ""))
 
+    def _ladder_still_s(self):
+        '''
+        「真的在爬」的竖向进展窗口（秒，`route.ladder_still_s`）—— **只有这一处读**。
+
+        返回 0.0 表示**这条判据不可用** ⇒ 调用方 fail-closed，退回老行为
+        （旗标为真就一直让路）。两种情形：
+          · 配置填 0 / 负数 / 读不到 / 畸形（用户明确要退回老行为）；
+          · 小地图全局坐标读不到（`loc_player_global` 取不到 ⇒ 永远测不到
+            竖向进展 ⇒ 若照常让路会一路不让，把"打几下"变成"吊在绳子上"，
+            那是 2026-10-13 真机实测过的更坏的故障）。
+
+        由来（用户 m08016 拍板 A「梯子让路收紧」，依据 = 2026-10-14 示范录制）：
+          让路块 `_climbing = bool(self.is_on_ladder) or cmd_move_y in (up, down)` 里，
+          前一项的旗标**只进不出** ⇒ 示范录制里梯上帧 2749（43.9%），其中
+          44/105 段整段全局 y 零变化（粘滞误判，1048 帧），人在这些帧里出手 910 次
+          全被让路吃掉；而路线真在爬的只占 674/2749。
+        '''
+        try:
+            _raw = (self.cfg.get("route") or {}).get("ladder_still_s", 0.7)
+        except Exception:                                     # noqa: BLE001
+            _raw = 0.7
+        if _raw is None:
+            _raw = 0.7
+        try:
+            _v = float(_raw)
+        except (TypeError, ValueError):
+            _v = 0.7
+        if _v <= 0 or _v > 30:        # 非法 / 明确关掉 ⇒ 本判据不可用
+            return 0.0
+        if getattr(self, "loc_player_global", None) is None:
+            return 0.0                # 拿不到全局坐标 ⇒ 测不到竖向进展
+        return _v
+
+    def _ladder_yield(self):
+        '''
+        「本帧要不要给绳/梯让路」—— 唯一判据点（让路块只调这一个）。
+
+        三路，任一成立即让路：
+          ① 路线本帧给的 `cmd_move_y` 是 up/down —— **始终让路**（拉绳只由路线负责，
+             见让路块 `:5900` 那段真机现场；本路不受 `ladder_still_s` 影响）；
+          ② `is_on_ladder` 为真 **且** 最近 `ladder_still_s` 秒内有过竖向进展
+             （小地图全局 y 变过）；
+          ③ `_ladder_still_s()` 返回 0.0（判据不可用）**且** `is_on_ladder` 为真
+             ⇒ fail-closed 退回老行为。
+        返回 `(让路吗, 为什么)`，`为什么` 直接进日志，方便用户核对"这次为什么没打"。
+        '''
+        if str(self.cmd_move_y) in ("up", "down"):
+            _why = f"路线指令 y={self.cmd_move_y}"
+            if self.is_on_ladder:
+                _why += "、且在梯子上（is_on_ladder）"
+            return True, _why
+        if not self.is_on_ladder:
+            return False, ""
+        _still_s = self._ladder_still_s()
+        if _still_s <= 0:
+            return True, "在梯子上（is_on_ladder）、竖向进展判据不可用（fail-closed 老行为）"
+        _age = time.time() - float(getattr(self, "t_ladder_move", 0.0))
+        if _age <= _still_s:
+            return True, (f"在梯子上（is_on_ladder）且 {int(_age * 1000)}ms 内"
+                          f"有竖向移动（小地图全局 y 变过）")
+        return False, f"旗标粘着：{int(_age * 1000)}ms 没有竖向移动"
+
+    def _rope_nudge_cfg(self):
+        '''
+        绳梯脚下"蹭一下"自救的四个参数 —— **只有这一处读配置**。
+
+        对应 `config/config_default.yaml` 的 `route.rope_nudge_s` /
+        `rope_nudge_ms` / `rope_nudge_cycle_s` / `rope_nudge_max_s`。
+
+        为什么要有这层自救（用户 m08454 报「卡楼梯」+ 真机日志取证）：
+          · `log/MSBot_2026-10-14_15-07-02.log`：15:16:40→15:17:25 停在
+            全局(78,78)、15:32:22→15:33:05 停在 (76,78)，**按着 up 45~50 秒**
+            不动；同期 `[按键状态] 指令(none up none) 近5秒实际发键 94~97 次`
+            ⇒ 键一直在发、不是按键失败。
+          · 机制：路线那根绳子是 1px 竖列，角色停在列上 ⇒ 最近像素是 up 像素
+            ⇒ 只发纯 up；能把角色"挪进绳子"的横向补位在
+            `if self.cmd_move_x == "none" and self.is_on_ladder` 里，而旗标要
+            "纵向真动过"才置真 ⇒ **自锁**。
+          · 跨轮取证：同样的僵持在 A+B 之前就有（02:20 轮 ≈45s @(256,78) 等）
+            ⇒ 不是本分支 A/B 引入的。
+
+        Returns:
+            (start_s, burst_ms, cycle_s, max_s)；`start_s <= 0` 表示**关掉本层**。
+            每个值的越界/畸形一律退回出厂值 —— 只有 `rope_nudge_s` 明确填
+            0/负数才是"用户要关掉"，其余一律按出厂值保守执行。
+        '''
+        _r = self.cfg.get("route") or {}
+
+        def _num(key, default, lo, hi):
+            try:
+                _v = float(_r.get(key, default))
+            except (TypeError, ValueError):
+                return default
+            if _v != _v or _v < lo or _v > hi:     # NaN / 越界
+                return default
+            return _v
+
+        # rope_nudge_s：负数也算"关掉"，所以下界放得很松（数值本身由调用方判 ≤0）
+        _start = _num("rope_nudge_s", 1.0, -1000.0, 30.0)
+        _ms = _num("rope_nudge_ms", 120.0, 20.0, 1000.0)
+        _cyc = _num("rope_nudge_cycle_s", 0.6, 0.1, 10.0)
+        _max = _num("rope_nudge_max_s", 6.0, 0.0, 120.0)
+        return _start, _ms, _cyc, _max
+
+    def _rope_nudge_dir(self, up_x, ud):
+        '''
+        本帧要不要给"蹭一下"的横向方向 —— **唯一判据点**（路线跟随的 up 分支只调它）。
+
+        触发条件（全部成立才蹭）：
+          ① `route.rope_nudge_s` > 0（用户没关掉本层）；
+          ② 路线本帧要的是 up/down（`ud`）—— 只治"站在绳梯脚下上不去"这一类；
+          ③ **不在梯子上**（`is_on_ladder` 为假）—— 在绳子上按左右会松手掉下去；
+          ④ 最近 `rope_nudge_s` 秒**没有竖向进展**（复用 A 那枚戳 `t_ladder_move`：
+             只认小地图全局 y 变化）；
+          ⑤ 从"开始该蹭"那一刻算起还没超过 `rope_nudge_max_s` 秒
+             （超过 ⇒ 放弃，退回老行为，交给既有的 `[路线够不着]`/watchdog 报警）。
+
+        方向：先朝绳梯那一列（`up_x`）走；已经在列上（|Δx| ≤ 1）就按时间片
+        **左右交替** —— 小地图推算的全局 x 有 ±2~4px 抖动（同一轮日志里到处是
+        `[梯子] 全局 x 变化 2px`），真实位置可能偏在列的一侧，左右交替才能
+        "扫"过那一列（真人也是这么蹭的）。
+
+        Args:
+            up_x: 本帧扫到的 up/down 像素的 x（route 图坐标 == 全局坐标）。
+            ud: 该像素的命令里的上下分量（"up" / "down" / "none"）。
+        Returns:
+            "left" / "right" / ""（"" = 本帧不蹭）
+        '''
+        _start, _ms, _cyc, _max = self._rope_nudge_cfg()
+        if _start <= 0:                       # ① 用户关掉了本层
+            return ""
+        if str(ud) not in ("up", "down"):     # ② 不是"要上下"
+            return ""
+        if getattr(self, "is_on_ladder", False):   # ③ 真在爬 ⇒ 绝不能蹭
+            return ""
+        if getattr(self, "loc_player_global", None) is None:
+            return ""                          # 拿不到全局坐标 ⇒ 判不了，保守不蹭
+        _stamp = float(getattr(self, "t_ladder_move", 0.0) or 0.0)
+        if _stamp <= 0.0:
+            # 本次开跑还**从没记录过竖向进展**（戳是 __init__ 的 0.0）⇒ 从这一刻起算，
+            # 否则 time.time() - 0.0 是个天文数字、会直接被 ⑤ 判成"早就该放弃"。
+            self.t_ladder_move = time.time()
+            return ""
+        _age = time.time() - _stamp
+        if _age < _start:                      # ④ 还没到"该蹭"的阈值
+            return ""
+        _over = _age - _start
+        if _max > 0 and _over > _max:          # ⑤ 蹭够久了 ⇒ 放弃
+            return ""
+        _dx = int(up_x) - int(self.loc_player_global[0])
+        if _dx <= -2:
+            return "left"                      # 朝绳子那一列走
+        if _dx >= 2:
+            return "right"
+        # 已经在列上 ⇒ 时间片左右交替：每 _cyc 秒里前 _ms 毫秒蹭一下、其余只按 up
+        if _cyc <= 0:
+            return ""
+        _burst = min(max(_ms / 1000.0, 0.0), _cyc)
+        _slot = int(_over / _cyc)
+        if (_over - _slot * _cyc) > _burst:
+            return ""                          # 这一档的"蹭"已经用完，只按 up 等判定
+        return "right" if _slot % 2 == 0 else "left"
+
     def update_cmd_by_mob_detection(self):
         # Get monster search box
-        margin = self.cfg["monster_detect"]["search_box_margin"]
+        # ── 感知框 / 攻击框分开（2026-10-13 加，用户选的方案 A）──────────────
+        # 旧实现：索敌框 == 攻击框 == loc_player ± (range/2 + margin)，只有 500×270
+        #   （1366×768 客户区的 13%）。用户真机 12 帧实测：整帧 53 只怪里 46 只
+        #   （87%）落在这个框外 ⇒ 现象是"身边明摆着有怪、机器人不认"。
+        # 新实现：**看得远、只打够得着的** ——
+        #   · 索敌（感知）框 = 上面那个口径 × monster_detect.detect_range_scale
+        #     （位置连续丢失时还会临时放大到整帧，都在 get_search_box 里）；
+        #   · 攻击判定只认 get_attack_range()（打得到的范围，**不含 margin**）；
+        #   · 看得见但够不着 → approach_mob 让它"走过去打"（见下面那段）。
+        # ⚠️ 帧尾画的那个蓝框必须走**同一个** get_search_box()，别在这里手算 ——
+        #    否则画的和用的不是一个框（tools/verify_mob_boxes.py 的 [6b] 钉这条）。
         if self.cfg["bot"]["attack"] == "aoe_skill":
-            dx = self.cfg["aoe_skill"]["range_x"] // 2 + margin
-            dy = self.cfg["aoe_skill"]["range_y"] // 2 + margin
             cooldown = self.cfg["aoe_skill"]["cooldown"]
         elif self.cfg["bot"]["attack"] == "directional":
-            dx = self.cfg["directional_attack"]["range_x"] + margin
-            dy = self.cfg["directional_attack"]["range_y"] + margin
             cooldown = self.cfg["directional_attack"]["cooldown"]
         else:
             raise RuntimeError(f"Unsupported attack mode: {self.cfg['bot']['attack']}")
-        x0 = max(0                      , self.loc_player[0] - dx)
-        x1 = min(self.img_frame.shape[1], self.loc_player[0] + dx)
-        y0 = max(0                      , self.loc_player[1] - dy)
-        y1 = min(self.img_frame.shape[0], self.loc_player[1] + dy)
+        x0, y0, x1, y1 = self.get_search_box()
+        # 两个框的尺寸（2026-10-14 加，**只给日志文案用**）：出招只看攻击框，
+        # 而画在画面上的、用户看到的那个框是索敌框 —— 两者差一大截，日志里必须给数字，
+        # 否则每次都要回去翻配置才知道"为什么 279px 还不打"。
+        _ax, _ay = self._attack_box_half()
+        _sbx = abs(int(x1) - int(x0)) // 2
+        _sby = abs(int(y1) - int(y0)) // 2
 
         # Get monsters in the search box
         _perf_t0 = time.perf_counter()
@@ -4403,8 +6321,21 @@ class MapleStoryAutoBot:
             self.monsters = self.get_monsters_in_range((x0, y0), (x1, y1))
             self._perf("怪检测", _perf_t0)
             self._mob_skip = 0
+            # ★ 本帧**真的**跑了一次检测（下面的"打完了没"只按检测帧计数 ——
+            #   降频时中间帧沿用的是上一次的 self.monsters，拿它计数会把
+            #   "打完"的判定延后/提前 `every_n_frames` 倍）。
+            _detected_now = True
         else:
             self._mob_skip = _skip
+            _detected_now = False
+
+        # ── 「有框不打」的第一大现场：窗口不在前台（2026-10-14 加）────────────
+        # 键盘层（src/input/KeyBoardController.py 的前台守卫）在窗口不在前台时
+        # **一个键都不发**（还会自动切回前台，节流 2s），而引擎照旧检测、照旧画框 ⇒
+        # 从画面上看就是"有框、有目标、就是不出招"。这一行把"打怪逻辑的问题"和
+        # "焦点/前台的问题"分开（纯观测，5 秒节流；内部先判 monsters/节流再查前台，
+        # 所以**不会**每帧打 win32 API）。
+        self._mob_no_attack_log("front")
 
         # ── 回正优先（最高优先级，2026-09-12）────────────────────────────────
         # 正在走回正线时，**完全不覆盖移动指令**，
@@ -4417,10 +6348,368 @@ class MapleStoryAutoBot:
         # ⚠️ 配套的出口在 update_cmd_by_route：回正线**一帧像素都找不到**时立刻
         #    退出回正状态（is_using_home_route=False），否则会「既不走也不打」。
         if self.is_using_home_route:
+            # 回正期间怪逻辑完全不碰走位与动作（上面那段注释）—— 这正是"有框却不打"
+            # 的另一个现场，所以在这里也留一行归因（纯观测，5s 节流）。
+            self._mob_no_attack_log("home_route")
             return
 
+        # ── 绳/梯让路（2026-10-13 修用户实测的「会卡在绳子上」）──────────────
+        # 判据：不动 cmd_move_x/cmd_move_y/cmd_action，上面那份 self.monsters 已经
+        # 更新过了（画面框/日志照旧）。
+        #   ① 本帧**路线给的** `cmd_move_y` 是 up/down —— 角色正要/正在爬。**始终让路**。
+        #   ② `self.is_on_ladder` —— 引擎自己的"在梯子上"状态。**2026-10-14 起收紧**
+        #      （用户 m08016 拍板 A）：旗标为真**且**最近 `route.ladder_still_s` 秒内
+        #      小地图全局 y 变过（真在上下走）才让路。理由 = 示范录制实测：
+        #        梯上帧 2749（43.9%），其中整段全局 y 零变化的粘滞段 44/105（1048 帧），
+        #        人在这些帧里出手 **910 次**，而引擎梯上出手率 **0.0%**（平台 16.5%）。
+        #      判据不可用（配置 ≤0 / 全局坐标读不到）⇒ fail-closed 退回老行为（一直让路）。
+        #      两个判据都在 `_ladder_yield()` 里（那才是唯一判据点，本块只问它）。
+        # 为什么必须有①（真机日志实证，`log/MSBot_2026-10-13_23-14-52.log`）：
+        #   梯子口的"离开梯子"判据是**小地图全局 x 变化 ≥ route.ladder_leave_x(2)**
+        #   （本意：爬到顶开始沿平台横向移动），而**怪逻辑的横向移动（靠近/转身）
+        #   恰好会让全局 x 变 2px** ⇒ 引擎把 is_on_ladder 判成 False（日志
+        #   `[梯子] 全局 x 变化 2px（80 → 82）⇒ 判定已离开梯子，停止按 up`）⇒
+        #   它不再补 up，怪逻辑又把 cmd_move_y 清零 / 把动作改成 attack ⇒ 角色
+        #   吊在绳子上反复起跳（同段日志里 `[靠近] …朝它走一段` 与上面那条交替
+        #   出现，还夹着 `[按键·跳跃] 想跳但被冷却挡住（已连挡 13 次）`）。
+        # ⇒ **拉绳/爬梯这件事只由路线负责**：爬的时候怪逻辑一律不碰走位与动作。
+        #   ⚠️ 别把这里放宽成"只让 x"：路线的 up 被清掉一样会吊在绳上。
+        _climbing, _why = self._ladder_yield()
+        if _climbing:
+            if getattr(self, "_stop_hold", False):
+                # 已经站定了，现在路线在爬 → 立刻把走位交回路线（不许钉在绳上）
+                self._stop_hold = False
+                self._stop_hold_empty = 0
+            if self.cmd_action == "attack":
+                # cmd_action 是**跨帧保持**的：不清的话在绳上会一路按技能键，
+                # 还挡掉路线在梯子顶那一下 jump。
+                self.cmd_action = "none"
+            _now_climb = time.time()
+            if _now_climb - float(getattr(self, "t_climb_yield_log", 0.0)) > 5.0:
+                self.t_climb_yield_log = _now_climb
+                logger.info(
+                    f"[绳/梯] 判定正在爬（{_why}）→ 怪逻辑让路："
+                    f"不站定、不靠近、不抢方向/动作（拉绳只由路线负责）"
+                    # ★ 2026-10-14：把"画面上的框"和"不打"对上 —— 让路期间检测照跑、
+                    #   框照画（用户 m05740 反馈的"有框却不打"，有一大半就是这里）。
+                    f"（画面上还有 {len(getattr(self, 'monsters', None) or [])} 个目标、"
+                    f"框照旧画）")
+            return
+
+        # ★ 2026-10-14：旗标还在、但已判定"不是真在爬"⇒ 不再让路。这是用户
+        #   m07230「攻击还是不够灵敏」→ m08016 拍板 A 之后新增的一行归因：
+        #   不改行为的话，用户只会看到"以前不打、现在打了"，却不知道是哪条生效。
+        if self.is_on_ladder and _why:
+            _now_stale = time.time()
+            if _now_stale - float(getattr(self, "t_ladder_stale_log", 0.0)) > 5.0:
+                self.t_ladder_stale_log = _now_stale
+                logger.info(
+                    f"[绳/梯] {_why} ⇒ **不再让路**：怪逻辑照常靠近/出招"
+                    f"（2026-10-14 用户拍板 A；路线给 up/down 时仍让路，"
+                    f"`route.ladder_still_s` 填 0 可退回老行为）"
+                    f"（画面上有 {len(getattr(self, 'monsters', None) or [])} 个目标）")
+
+        # ── 巡逻中「停下来打怪」（2026-10-13 加，用户要求）──────────────────
+        # 用户原话：「巡逻中，检测到怪，打完怪再移动，而不是在移动中穿插着攻击」。
+        #
+        # 旧行为：`update_cmd_by_route` 每帧先把移动指令写好，本函数只在上面**叠**
+        #   一个 `cmd_action="attack"` ⇒ 角色边走边打：路过的怪只吃到擦身而过的
+        #   几刀就被走远了；而且出招节奏被路线方向不断打断（directional 还要先
+        #   转身，转完人已经走出攻击框）。
+        #
+        # 新行为（`monster_detect.stop_to_attack`，默认开）：
+        #   ① 索敌框里**有怪** → 本帧移动清零（站定），只出招；
+        #   ② 框里**连续 stop_attack_clear_frames 个检测帧**没怪 → 判定打完，
+        #      松开、把走位交回路线（`update_cmd_by_route` 下一帧照常给方向）；
+        #   ③ 两条安全阀（都不会把角色钉死）：
+        #      · 停下后**一直出不了招**（idle_s ≈ max(2.5, 攻击冷却×2.5) 秒没有
+        #        攻击指令）→ 立刻放行，并打一条 WARNING。这只说明"怪在框里但
+        #        打不着"（正上方/正后方/被地形挡住），没必要傻站；
+        #      · 停下总时长 > stop_attack_timeout_s（默认 20s）→ 强制放行 + WARNING
+        #        （治"血厚打不死"或检测一直在闪的情形）；
+        #      · 强制放行后要求**先清场一次**（一次检测帧框里为空）才允许再停下 ——
+        #        否则在"满屏都是怪"的图上会变成：停 20s → 放行 1 帧 → 又停 20s，
+        #        永远走不出这一段路线。
+        #
+        # ⚠️ 为什么清零必须写在**本函数**里：`cmd_move_x/cmd_move_y` 是**跨帧保持**
+        #    的实例属性，而 `update_cmd_by_route()` 在 HuntingState 里**先于**本函数
+        #    执行（`src/states/hunting.py` 的 on_frame：route → check_reach_goal →
+        #    mob_detection）—— 只有在这里清零才能盖掉本帧路线刚写的方向。
+        # ⚠️ 回正线期间不参与（上面那条 return 已经拦掉）：回正是"回家"，
+        #    优先级高于打怪，这条规则从 2026-09-12 起就在，别挪。
+        # ⚠️ 看门狗不会因此误报卡死：出招会刷新 `t_last_attack`，而
+        #    `is_player_stuck` 有 `watchdog.attack_grace`（默认 5s）豁免；
+        #    真打不到时它照旧弹 alert —— 那正是我们要的信号，别去屏蔽它。
+        # ── "打得到"的那一批（攻击框内）──────────────────────────────────────
+        # 索敌框（x0..y1）可能被 detect_range_scale 放大很多，但**攻击判定只认
+        # 攻击框**：够不着的怪不该让角色停下来出招（打不到，白发）。
+        # `_far` = 看得见、够不着的那些（交给 approach_mob 走过去打）。
+        _engage = self._mobs_in_attack_box()
+        _eng_ids = {id(_m) for _m in _engage}
+        _far = [_m for _m in self.monsters if id(_m) not in _eng_ids]
+        # ★ 2026-10-14 加（用户 m06852「记录下怪物的检测信息，现在的攻击还是不够
+        #   灵敏」）：把**这一帧的检测结果**单开一行写下来 —— 只写"怪N"看不出
+        #   它在哪、为什么不算够得着。纯观测（异常只吼一次，绝不影响判定）。
+        self._log_monster_detect(_engage, _far)
+        # 「第一只怪进攻击框」的时刻 —— 出招那一刻用它算"灵敏度"（进框→首刀 ms）。
+        # 框内空了就作废：那一次交战已经结束，下一个目标要重新计时（否则会拿
+        # "上一只怪的进框时刻"去算，把延迟算成几十秒）。
+        if _engage:
+            if getattr(self, "_eng_first_t", None) is None:
+                self._eng_first_t = time.time()
+        elif getattr(self, "_eng_first_t", None) is not None:
+            self._eng_first_t = None
+        _md_stop = self.cfg.get("monster_detect") or {}
+        _stop_to_attack = bool(_md_stop.get("stop_to_attack", True))
+        # ── 够不着就走过去打（approach_mob，2026-10-13 用户选的方案 A）────────
+        # 只在**同一层**横着走：怪与角色高度差 <= approach_dy_tol（默认 60px）。
+        # 跨层（上面/下面的平台）一律不硬走 —— 那要爬梯子/跳，交给路线；
+        # 历史上"窄平台上乱抽方向直接掉下去"就是这么来的。
+        _approach = bool(_md_stop.get("approach_mob", True))
+        # ⚠️ 「同一层」的高度容差（`approach_dy_tol`）与两个防抖参数
+        #    （`approach_confirm_s` 出现确认、`approach_dir_min_s` 方向最小保持）
+        #    都读在 `_pick_approach_target()` 里 —— 挑目标的规则只有那一处，
+        #    两个调用点（锁定期间追怪 / 松开后靠近）不再各写一遍。
+        _clear_frames = max(1, int(_md_stop.get("stop_attack_clear_frames", 2) or 2))
+        # ★ 2026-10-14 P1：把"框空多久算打完"从**帧数**改成**秒数**（帧数只当最小值）。
+        #   帧数阈值是**采样率相关**的：同样"空 2 帧"，14.7Hz 是 136ms、3.3fps 是 600ms
+        #   —— 用户一改 every_n_frames，行为就跟着变。秒数阈值与采样率无关。
+        try:
+            _clear_s = float(_md_stop.get("stop_attack_clear_s", 0.3) or 0.0)
+        except (TypeError, ValueError):
+            _clear_s = 0.3
+        if _clear_s < 0:
+            _clear_s = 0.0
+        try:
+            _stop_timeout = float(_md_stop.get("stop_attack_timeout_s", 20) or 0)
+        except (TypeError, ValueError):
+            _stop_timeout = 20.0
+        # ⚠️ 用 max(2.5, 冷却×2.5)：冷却短的 AOE（0.05s）别 2 帧就误判"打不着"，
+        #    冷却长的 directional（0.9s）也要给够一次转身+出招的时间。
+        try:
+            _cd = float(cooldown)
+        except (TypeError, ValueError):
+            _cd = 0.0
+        _idle_s = max(2.5, _cd * 2.5)
+        _now = time.time()
+        _holding = bool(getattr(self, "_stop_hold", False))
+        # ── 目标锁定（2026-10-14 加，用户要求「一旦发现目标就持续攻击，直到怪物消失」）──
+        # 修之前的行为（真机日志 MSBot_2026-10-14_10-03-15.log 11:02 段实证）：
+        #   放行判据是「**攻击框**里连续 stop_attack_clear_frames(2) 个**检测帧**没怪」
+        #   —— `every_n_frames: 2` + 28fps ⇒ **约 0.15 秒**就判"打完"。而 AOE 攻击框
+        #   只有 ±(range_x/2, range_y/2)，怪又在走动 ⇒ 日志里 [停下打怪] 与 [判定打完]
+        #   每秒抖好几次，`运行状态` 几乎全是 `指令(left none none)`（一直在走、基本没打）。
+        #   ⇒ 缺的是**目标记忆**：全项目没有任何"刚才在打哪只怪"的状态。
+        #
+        # 现在：攻击框里认出过怪就记住它 + 时间戳；在 `target_hold_s` 秒内**不判"打完"**，
+        # 它不在攻击框里就追过去（同层）、追不到就守着最后位置继续出招；
+        # 直到"连续 target_hold_s 秒没再看见它"才判定怪物已消失、恢复巡逻。
+        # ⚠️ `target_hold_s: 0` = 关掉本功能（逐字退回老行为），默认 3.0s。
+        # ⚠️ 两条安全阀（2.5s 出不了招 / 停留上限 20s）照旧生效 —— 不会把角色钉死。
+        try:
+            _hold_s = float(_md_stop.get("target_hold_s", 3.0) or 0.0)
+        except (TypeError, ValueError):
+            _hold_s = 3.0
+        if _hold_s < 0:
+            _hold_s = 0.0
+        if _detected_now and _engage and _hold_s > 0:
+            _lp = self.loc_player
+            _near = min(_engage,
+                        key=lambda _m: (abs(_m["position"][0] + _m["size"][0] // 2 - _lp[0])
+                                        + abs(_m["position"][1] + _m["size"][1] // 2 - _lp[1])))
+            # 上一把锁定已经过期 ⇒ 这是**新**目标（t0 供日志/诊断用）
+            if _now - float(getattr(self, "_mob_lock_seen_t", 0.0)) > _hold_s:
+                self._mob_lock_t0 = _now
+            self._mob_lock_seen_t = _now
+            self._mob_lock_pos = (_near["position"][0] + _near["size"][0] // 2,
+                                  _near["position"][1] + _near["size"][1] // 2)
+            self._mob_lock_n = len(_engage)
+            # 又看见它了 ⇒ "框空"的计时**从头算**（P1 的时间窗必须以**连续空窗**为准；
+            # 怪只是走出一帧又回来，不该攒够秒数）
+            self._stop_hold_empty = 0
+            self._stop_hold_empty_t0 = 0.0
+        _lock_seen = float(getattr(self, "_mob_lock_seen_t", 0.0) or 0.0)
+        _locked = bool(_hold_s > 0 and _lock_seen > 0 and _now - _lock_seen <= _hold_s)
+        if not _stop_to_attack:
+            # 关掉这个功能 = 退回"边走边打"；同时把停留状态清干净（别留僵尸态）
+            self._stop_hold = False
+            self._stop_hold_empty = 0
+            self._stop_hold_need_clear = False
+            _holding = False
+        elif _detected_now and not _engage:
+            # 这一帧真的跑了检测、**攻击框内**为空 → 判"这段打完了"（也解除封锁）
+            # ⚠️ 判据用 _engage 而不是 self.monsters：远处看得见但够不着的怪
+            #    不该让"打完"永远判不出来（那样会一直站着等 idle 安全阀）。
+            self._stop_hold_need_clear = False
+            if _holding:
+                # ★★ 2026-10-14 第二次改（低频识别优化 P1，用户 m05009「落地」）：
+                #   放行判据 = 「**连续空够 `stop_attack_clear_s` 秒**」+「空够
+                #   `stop_attack_clear_frames` 个检测帧」+「**本次停留出过招**」。
+                #   三个都要满足才判"打完了"：
+                #     · 秒数：与采样率无关（帧数阈值在 14.7Hz 是 136ms、3.3fps 是 600ms）；
+                #     · 检测帧数：兜底最小值，防"一帧就放行"（降频时也成立）；
+                #     · 出过招：**秒杀怪**的正解 —— 怪一刀就死，之后框里一直空着，
+                #       旧规则会白站 `target_hold_s`(3.0) 秒。反过来，一次都没出过招
+                #       说明"不是打完了，是打不着"（在正上/正下方、被地形挡住），
+                #       那种情况**不该**记成"打完"，交给锁定过期或 idle 安全阀放行。
+                #
+                # ⚠️★ 2026-10-14 第三次改（真机日志 MSBot_2026-10-14_11-42-16.log 实证）：
+                #   **"出过招 + 空够秒数 ⇒ 收手"这条不受目标锁定阻拦**。
+                #   病根：原来整段包在 `if _holding and not _locked:` 里，而
+                #   `target_hold_s: 3.0` 决定了"最后看见之后 3 秒内"锁定恒为真
+                #   ⇒ 这条判据**永远轮不到**：那次真机日志里只有
+                #   `目标已消失（连续 3s 没再看见它）`，停留时长清一色 3.1~4.2s
+                #   —— 一刀秒掉的怪同样白站 3 秒（P1 想修的正是它）。
+                #   现在：出过招 + 框空够秒数 ⇒ 立刻收手（0.3s 量级）；
+                #   一次都没出过招 ⇒ 仍然靠锁定/idle 撑着继续找（锁定期**不**判完）。
+                _empty_t0 = float(getattr(self, "_stop_hold_empty_t0", 0.0) or 0.0)
+                if _empty_t0 <= 0.0:
+                    _empty_t0 = _now
+                    self._stop_hold_empty_t0 = _now
+                self._stop_hold_empty = int(getattr(self, "_stop_hold_empty", 0)) + 1
+                _empty_for = _now - _empty_t0
+                _hit_done = float(getattr(self, "t_last_attack", 0.0)) >= \
+                    float(getattr(self, "_stop_hold_t0", 0.0))
+                _empty_long = bool(self._stop_hold_empty >= _clear_frames
+                                   and _empty_for >= _clear_s)
+                # ★★ "画面上还看得见**追得到**的怪吗"（2026-10-14 第三次改的配套）：
+                #   还看得见 ⇒ **不收手** —— 多半就是它本人挨了一刀走出攻击框，或者
+                #   旁边还有别的活口；两种情况都该继续打/追（"走过去打"也是用户要的）。
+                #   一只都看不见 ⇒ 判定打完（一刀秒掉的怪走这条，0.3s 就收手，
+                #   不再白站 target_hold_s 秒）。
+                #   三个条件缺一不可：
+                #     · `_far` 非空 —— 画面上还有怪；
+                #     · `_approach` —— 用户允许"走过去打"。关掉它就等于"框外的当没看见"，
+                #       那就必须能判"打完"，否则远处一只够不着的怪会让人**永远走不掉**
+                #       （`tools/verify_mob_sight.py`【7】钉的就是这条）；
+                #     · `_locked` —— 这是**目标锁定**这套功能的一部分；`target_hold_s: 0`
+                #       关掉锁定时逐字退回老口径。
+                #   ⚠️ 跨层的怪（approach_dy_tol 之外，追不到）也算"看得见" ⇒ 极端情况下
+                #      会对着上层平台干等到 idle 安全阀（2.5s 出不了招）放行。
+                #      这比"把还活着的怪扔下就走"保守，可以接受。
+                _still_there = bool(_far) and _approach and _locked
+                if _empty_long and _hit_done and not _still_there:
+                    # ⚠️ 先把"空了几个检测帧"留证**再**清零：原来清零在前、打印在后，
+                    #    于是真机日志里这一行永远写着「（0 个检测帧）」——
+                    #    看起来像"一个检测帧都没空就判完了"，其实放行要求 ≥2 个检测帧，
+                    #    是**日志自己把证据抹掉了**（2026-10-14 从 log 12-05-06 的
+                    #    76 条判定打完里 61 条印着 0 反查出来）。
+                    _empty_frames = int(getattr(self, "_stop_hold_empty", 0))
+                    self._stop_hold = False
+                    self._stop_hold_empty = 0
+                    self._stop_hold_empty_t0 = 0.0
+                    self._mob_lock_seen_t = 0.0   # 收手 ⇒ 锁定一起清掉，别留着
+                    _holding = False
+                    logger.info(
+                        f"[停下打怪] 出过招 + 连续 {_empty_for:.1f}s"
+                        f"（{_empty_frames} 个检测帧）框内没怪 → 判定打完，"
+                        f"恢复巡逻")
+                elif _empty_long and not _locked \
+                        and _now - float(getattr(self, "t_empty_nohit_log", 0.0)) > 5.0:
+                    # 一次都没出过招：不是"打完了"，是"打不着" —— 不判完，但**不许静默**
+                    self.t_empty_nohit_log = _now
+                    logger.info(
+                        f"[停下打怪] 框里已经空 {_empty_for:.1f}s，但本次停留"
+                        f"**一次都没出过招** → 不判「打完」，继续找（锁定还剩 "
+                        f"{max(0.0, _hold_s - (_now - _lock_seen)):.1f}s；"
+                        f"到点或 idle 安全阀会放行）")
+        elif _detected_now and not _holding \
+                and not getattr(self, "_stop_hold_need_clear", False):
+            self._stop_hold = True
+            self._stop_hold_empty = 0
+            self._stop_hold_empty_t0 = 0.0
+            self._stop_hold_t0 = _now
+            _holding = True
+            logger.info(
+                f"[停下打怪] 攻击框里认出 {len(_engage)} 个目标（框外还有 "
+                f"{len(_far)} 个够不着的），停下打完再走"
+                f"（停留上限 {_stop_timeout:g}s、{_idle_s:g}s 出不了招就放行）")
+        if _holding:
+            # 参考点：最近一次出招 或 本次停留开始（哪个更晚取哪个）——
+            # 停下后一次都没出过招也算"闲着"，不能被旧的 t_last_attack 骗过去。
+            _last_act = max(float(getattr(self, "t_last_attack", 0.0)),
+                            float(getattr(self, "_stop_hold_t0", _now)))
+            _held = _now - float(getattr(self, "_stop_hold_t0", _now))
+            if _hold_s > 0 and _lock_seen > 0 and _now - _lock_seen > _hold_s:
+                # ★ 目标锁定过期：连续 target_hold_s 秒没再看见它 ⇒ 判定"怪物已消失"。
+                #   这才是用户要的"直到怪物消失"；不是"离开攻击框 0.15 秒就放行"。
+                self._stop_hold = False
+                self._stop_hold_empty = 0
+                self._stop_hold_need_clear = False
+                self._mob_lock_seen_t = 0.0
+                _holding = False
+                logger.info(
+                    f"[停下打怪] 目标已消失（连续 {_hold_s:g}s 没再看见它）→ 恢复巡逻"
+                    f"（本次停留 {_held:.1f}s）")
+            elif _now - _last_act > _idle_s:
+                self._stop_hold = False
+                self._stop_hold_empty = 0
+                self._stop_hold_need_clear = True
+                _holding = False
+                logger.warning(
+                    f"[停下打怪] 已停下 {_now - _last_act:.1f}s 一直出不了招 → 放行，"
+                    f"恢复巡逻（框里的目标多半打不着：正上/正下方或被地形挡住；"
+                    f"要它继续站着打就查 monster_detect.stop_to_attack 相关配置）")
+            elif _stop_timeout > 0 and _held > _stop_timeout:
+                self._stop_hold = False
+                self._stop_hold_empty = 0
+                self._stop_hold_need_clear = True
+                _holding = False
+                logger.warning(
+                    f"[停下打怪] 已停留 {_held:.1f}s（上限 {_stop_timeout:g}s）仍在出招 "
+                    f"→ 强制恢复巡逻（可疑：怪血厚打不死 / 检测在闪）。"
+                    f"清场一次之后才会再停下打怪")
+        if _holding:
+            # 站定：清掉路线本帧刚写的走位，把"出招/朝向"留给下面的攻击分支
+            # （directional 的"先转身"会自己把 cmd_move_x 设成目标方向 —— 那一小步
+            #   是出招必需的，不是"边走边打"）
+            #
+            # ★ 例外（2026-10-14 目标锁定）：锁定期间目标暂时不在攻击框里 ⇒ **追过去**，
+            #   而不是站着等 2.5s 的 idle 安全阀。只追**同一层**的
+            #   （|dy| <= approach_mob 的 approach_dy_tol，默认 60px），梯子上不追。
+            _chase, _chase_d, _chase_dy = None, None, None
+            if _locked and not _engage and _approach and _far and not self.is_on_ladder:
+                # 2026-10-14 P1：挑目标统一走 `_pick_approach_target`
+                # （含"出现确认"与"方向最小保持"），不再两处各抄一遍取最近的循环。
+                _chase, _chase_d, _chase_dy = self._pick_approach_target(_far, _now)
+            if _chase:
+                self.cmd_move_x = _chase
+                self.cmd_move_y = "none"
+                if _now - float(getattr(self, "t_lock_chase_log", 0.0)) > 2.0:
+                    self.t_lock_chase_log = _now
+                    logger.info(
+                        f"[锁定] 目标暂时不在攻击框（框外还有 {len(_far)} 个）→ 朝它所在的"
+                        f"方向{_chase}追一段，追上继续打；连续 {_hold_s:g}s 没再看见才算消失")
+            else:
+                self.cmd_move_x = "none"
+                self.cmd_move_y = "none"
+
         # Check if no mob to attack
-        if len(self.monsters) == 0:
+        if not _engage:
+            # ★ 目标锁定期间（2026-10-14）：目标只是**暂时**没被认出来（走出攻击框 /
+            #   动画帧没匹配上），别当成"打完了" —— 朝最后看见它的方向继续出招，
+            #   直到锁定过期或两条安全阀放行。用户原话：「一旦发现目标就持续攻击，
+            #   直到怪物消失」。
+            # ⚠️ 只有 AOE 能"没目标也出招"（技能不分方向）；directional 打的是**当前
+            #   朝向**，没目标时补发等于打空气，所以那里不补 —— 交给 idle 安全阀。
+            if _holding and _locked and self.cfg["bot"]["attack"] == "aoe_skill":
+                _lpos = getattr(self, "_mob_lock_pos", None)
+                if _lpos is not None and not self.is_on_ladder \
+                        and self.cmd_move_x_last != ("left" if _lpos[0] < self.loc_player[0]
+                                                     else "right"):
+                    # 只发**一帧**转向（cmd_move_x 是跨帧保持的，连发会变成走路）
+                    self.cmd_move_x = ("left" if _lpos[0] < self.loc_player[0] else "right")
+                if time.time() - self.t_last_attack > cooldown:
+                    self.cmd_action = "attack"
+                    self._note_attack(0)      # 纯观测：目标暂时不在框里也算一次出招
+                    self.t_last_attack = time.time()
+                else:
+                    # 锁定补招也被冷却挡住（engage_n=0：目标只是暂时不在框里）
+                    self._mob_no_attack_log(
+                        "cooldown", engage_n=0, far_n=len(_far),
+                        half_x=_ax, half_y=_ay,
+                        cooldown_left=cooldown - (time.time() - self.t_last_attack))
+                return
             # ⚠️ 必须清掉上一帧残留的攻击指令（2026-09-12 修）
             # cmd_move_x / cmd_move_y / cmd_action 是**跨帧保持**的实例属性，原实现
             # （上游逐字如此）在这里直接 return，于是只要某一帧设过 "attack"，怪没了
@@ -4430,6 +6719,43 @@ class MapleStoryAutoBot:
             # 但回正线接不上、或路线走到 goal 时它不会覆盖，这颗雷就会响 —— 所以必须清。
             if self.cmd_action == "attack":
                 self.cmd_action = "none"
+            # ── 走得过去就打（2026-10-13 加，用户选的方案 A）──────────────────
+            # 索敌框里看得见、但**攻击框外**的怪 → 朝最近的走过去；
+            # 一旦它进攻击框，上面的"停下打怪"就接管：站定出招，打完再走。
+            # 保守限制：
+            #   ① 只走**同一层**（高差 <= approach_dy_tol，默认 60px）；
+            #   ② 梯子上不走（update_cmd_by_route 刚配好上下，横向一动就被判成离开梯子）；
+            #   ③ `approach_mob: false` 退回老行为（框外的当没看见，只打框内的）。
+            # ⚠️ 路线的 cmd_action 保持不动（不硬改成 none）：路线里的 jump 像素是
+            #    用户亲手录的"这里要跳"，清掉它反而可能走到悬崖边不跳。
+            if _approach and _far and not self.is_on_ladder:
+                _dir, _tkey, _tdy = self._pick_approach_target(_far)
+                if _dir:
+                    self.cmd_move_x = _dir
+                    self.cmd_move_y = "none"
+                    if _now - float(getattr(self, "t_approach_log", 0.0)) > 2.0:
+                        self.t_approach_log = _now
+                        logger.info(
+                            f"[靠近] 攻击框外还有 {len(_far)} 个目标"
+                            f"（最近的在{_dir}侧 {_tkey:g}px、高差 "
+                            f"{_tdy:+d}px）→ 朝它走一段，"
+                            f"进攻击框后再停下打"
+                            # ★ 2026-10-14：同一行里给出**两个框的尺寸** ——
+                            #   用户 m05740「有检测框、也在攻击范围内，却没有立马攻击」，
+                            #   根子就是画出来的框（索敌框）比出招判据（攻击框）大一圈。
+                            #   不给数字的话，每次都得回去翻配置才知道差多少。
+                            f"（攻击框 ±{_ax}×±{_ay}px；"
+                            f"画出来的框是索敌框 约 ±{_sbx}×±{_sby}px）")
+                else:
+                    # 看得见却够不着，但本帧没追过去（还没凑齐"连续两次确认"，或都在别的层）
+                    self._mob_no_attack_log("approach_pending", far_n=len(_far),
+                                            half_x=_ax, half_y=_ay,
+                                            **self._engage_gap_facts(_far))
+            else:
+                # approach_mob 关着 ⇒ 框外的一律不管；或 _far 为空（异常兜底）
+                self._mob_no_attack_log("approach_off" if not _approach else "no_engage",
+                                        far_n=len(_far), half_x=_ax, half_y=_ay,
+                                        **self._engage_gap_facts(_far))
             return
 
         # Update attack command
@@ -4440,11 +6766,19 @@ class MapleStoryAutoBot:
                 # 用户实测「后方的怪打不到」。AOE 不需要等转身，同帧出招即可。
                 # ⚠️ 梯子上不抢方向键（见下方 directional 分支的说明）。
                 if not self.is_on_ladder:
-                    face = self.get_face_direction()
+                    # ⚠️ 只看**攻击框内**的怪来定朝向：远处够不着的怪不该把角色
+                    #    转身背对近处这只（感知框放大后 this 才会踩到）
+                    face = self.get_face_direction(_engage)
                     if face is not None and self.cmd_move_x_last != face:
                         self.cmd_move_x = face
                 self.cmd_action = "attack"
+                self._note_attack(len(_engage))   # 纯观测：出招时攻击框内有几只
                 self.t_last_attack = time.time()
+            else:
+                # 冷却没到（AOE 默认 0.05s，正常几乎不会命中；命中说明上一帧刚出过招）
+                self._mob_no_attack_log(
+                    "cooldown", half_x=_ax, half_y=_ay,
+                    cooldown_left=cooldown - (time.time() - self.t_last_attack))
 
         elif self.cfg["bot"]["attack"] == "directional":
             # Get nearest monster to player
@@ -4457,6 +6791,7 @@ class MapleStoryAutoBot:
                 # —— 同样要清残留，否则会继续打空气
                 if self.cmd_action == "attack":
                     self.cmd_action = "none"
+                self._mob_no_attack_log("direction", half_x=_ax, half_y=_ay)
                 return
             # Attack Command
             if time.time() - self.t_last_attack > cooldown:
@@ -4475,6 +6810,7 @@ class MapleStoryAutoBot:
                 #    梯子上照常打怪，只是不改朝向。
                 if self.is_on_ladder:
                     self.cmd_action = "attack"
+                    self._note_attack(len(_engage))   # 纯观测
                     self.t_last_attack = time.time()
                     return
                 # ── 转身状态机（2026-09-17 重写）────────────────────────────
@@ -4542,6 +6878,7 @@ class MapleStoryAutoBot:
                     self._turn_pending_dir = None
                 self.cmd_action = "attack"
                 self.cmd_move_x = "none"
+                self._note_attack(len(_engage))       # 纯观测
                 self.t_last_attack = time.time()
 
     def update_cmd_by_random(self):
@@ -4629,9 +6966,19 @@ class MapleStoryAutoBot:
         if not self.img_routes:
             return
         # Switch to next route map
+        _old_route = self.idx_routes
         self.idx_routes = (self.idx_routes+1)%len(self.img_routes)
         self.route_reverse = False     # 换段了，往返方向要复位
-        logger.debug(f"Change to new route:{self.idx_routes}")
+        # ★ 2026-10-14：原来这里只有 `logger.debug("Change to new route:…")` ——
+        #   **debug 不写进日志文件**，于是"段号到底跳没跳、为什么跳"永远查不出来
+        #   （用户 2026-10-14 报「从到达最后 route 的终点，会跳跃到后面几个 route」，
+        #   而日志里连一条切段记录都没有）。提到 INFO：一次切段就一行，不刷屏，
+        #   且带上 from→to、触发原因（踩到 goal / 临近终点）与当时全局坐标。
+        logger.info(
+            f"[切段] 第 {_old_route + 1}/{len(self.img_routes)} 段 → "
+            f"第 {self.idx_routes + 1}/{len(self.img_routes)} 段"
+            f"（{'踩到 goal 像素' if self.cmd_action == 'goal' else '离本段终点够近'}；"
+            f"全局 {tuple(self.loc_player_global) if self.loc_player_global else None}）")
 
     def run_once(self):
         '''
@@ -4670,7 +7017,27 @@ class MapleStoryAutoBot:
             if self.is_using_home_route and self.img_route_home is not None:
                 self.img_route = self.img_route_home
             else:
-                self.img_route = self.img_routes[self.idx_routes]
+                # ⚠️ 这里**绝不能**写裸下标 —— 2026-10-12 与 2026-10-14 两次真机停摆
+                #    都是同一个 IndexError（按下标取 route 时越界）。
+                #    界面按【开始】会在同进程里重跑 load_config（AutoBotController.py:109），
+                #    那次调用把 `img_routes` **换成了新列表**，而 `idx_routes` 可能还停在
+                #    上一轮的值（重录成更少段 / 换图 / 有段被判废）。
+                #    上面那道 `and self.img_routes` 只判"空不空" ⇒ 挡不住这个坑；
+                #    崩溃点又排在"路线推进"之前 ⇒ 段号永远回不来 ⇒ 每帧都炸。
+                #    所以这里先取一次快照（避免列表对象被换掉的空窗），再带边界取。
+                _routes = self.img_routes
+                # 下面的判据**按下标取之前先判边界**（自检 `tools/verify_route_index_bounds.py`
+                # 【2】① 钉的就是这个字面量形态）；取图时用快照 `_routes`，避免列表对象
+                # 正好在两次读之间被 load_config 换掉。
+                if 0 <= self.idx_routes < len(self.img_routes):
+                    self.img_route = _routes[self.idx_routes]
+                else:
+                    logger.warning(
+                        f"[路线] 段号 {self.idx_routes} 越界（共 {len(_routes)} 段），"
+                        f"本帧改用第 1 段并把段号重置（load_config 里也会钳，这里再兜一次）。")
+                    self.idx_routes = 0
+                    if _routes:
+                        self.img_route = _routes[self.idx_routes]
             if self.is_show_debug_window:
                 self.img_route_debug = cv2.cvtColor(self.img_route, cv2.COLOR_RGB2BGR)
 
@@ -4727,15 +7094,40 @@ class MapleStoryAutoBot:
         # 每 30 帧只在跨过阈值那一帧告警一次，不刷屏。
         _streak = self.nametag_miss_streak
         if _streak >= 30 and _streak % 30 == 0:
+            # ★ 2026-10-14 加：与这条告警**同源**，把"当时的画面"存到 debug/。
+            #   纯观测：判据、节流、fail-open 都在 _dump_nametag_miss 里。
+            self._dump_nametag_miss(_streak)
             if not self.nametag_ever_hit:
-                logger.error(
-                    f"[名字定位] 开局至今 {_streak} 帧一次都没定位到角色名名牌"
-                    f"（阈值 {self.cfg['nametag']['diff_thres']}）—— 位置仍是初始值，"
-                    f"攻击框会落在画面左上角，等于打不到怪。\n"
-                    f"        排查：① 当前地图玩家是不是太多、自己的名牌被盖住了？"
-                    f"先走到人少处或换个位置\n"
-                    f"              ② 角色名/称号改过了吗？改过要重新标定模板\n"
-                    f"              ③ 点工具箱「保存诊断包」发给 AI，让他看模板本身还认不认得")
+                if getattr(self, "loc_nametag_from_cache", False):
+                    # 2026-10-14 加：开局用的是**存盘位置**（上次命中时存下的）。
+                    # 比"停在 (0,0)、攻击框跑到左上角"好得多，但角色还在走 ——
+                    # 位置是死的，偏差累积超过攻击框半高照样打空，所以照样要吼，
+                    # 只是严重程度从 ERROR 降为 WARNING（并非"什么都没得用"）。
+                    logger.warning(
+                        f"[名字定位] 开局至今 {_streak} 帧没认出角色名名牌"
+                        f"（阈值 {self.cfg['nametag']['diff_thres']}），"
+                        f"正用**上次保存的位置** {self.loc_player} 出招"
+                        f"（存盘文件 {self._nametag_pos_path()}）。\n"
+                        f"        注意：角色还在走、位置却是死的 —— 偏得多时会打空"
+                        f"（攻击框上下只有 "
+                        f"{self.cfg['directional_attack']['range_y']}px）。\n"
+                        f"        常见原因：① 地图拥挤、名牌被别人盖住 ⇒ 走到人少处"
+                        f"② 名字/称号改过 ⇒ 重新标定名字模板"
+                        f"（界面上按 F2「标定名字」；或 python -m tools.calibrate_nametag）\n"
+                        f"        ③ 换过角色 / 搬过游戏窗口 ⇒ 删掉上面那个 json 文件即可，"
+                        f"下次命中会自动重新写一份")
+                else:
+                    logger.error(
+                        f"[名字定位] 开局至今 {_streak} 帧一次都没定位到角色名名牌"
+                        f"（阈值 {self.cfg['nametag']['diff_thres']}）—— 位置仍是初始值，"
+                        f"攻击框会落在画面左上角，等于打不到怪。\n"
+                        f"        （这张图没有可用的「上次位置」记录："
+                        f"{self._nametag_pos_path()} 不存在 / 被删 / 读不动；"
+                        f"本图第一次成功命中后会自动写一份）\n"
+                        f"        排查：① 当前地图玩家是不是太多、自己的名牌被盖住了？"
+                        f"先走到人少处或换个位置\n"
+                        f"              ② 角色名/称号改过了吗？改过要重新标定模板\n"
+                        f"              ③ 点工具箱「保存诊断包」发给 AI，让他看模板本身还认不认得")
             else:
                 # ⚠️★ 2026-09-28 改文案（issue #6 排查）：
                 #    原来写的是「位置沿用上次命中的结果 —— 同图内角色屏幕位置基本不动，
@@ -4757,7 +7149,7 @@ class MapleStoryAutoBot:
                     f"        常见原因：地图拥挤（名牌被别的玩家盖住）/ 名字或称号改过 / "
                     f"模板没标定好。\n"
                     f"        若长时间不恢复：① 先走到人少处 ② 重新标定名字模板"
-                    f"（双击项目根的「标定名字标签.bat」）")
+                    f"（界面上按 F2「标定名字」；或 python -m tools.calibrate_nametag）")
                 # ── 匹配分数量级（2026-09-28 加，issue #6 排查用）────────────
                 # 为什么必须打：光报"没命中"没法定位病因 —— 差一点点（模板/阈值问题）
                 #   和差很多（名牌被挡 / 位置不对）是**完全不同的两件事**，处理办法也不同。
@@ -4773,9 +7165,13 @@ class MapleStoryAutoBot:
                     if _h:
                         _best = min(_h)
                         _near = _best < float(self.cfg["nametag"]["diff_thres"]) * 3
-                        _verdict = ("**非常接近阈值**，多半是阈值太紧或模板不够贴合"
+                        _verdict = ("**分数差一点点** ⇒ 阈值/模板可能偏紧，"
+                                    "**也可能是名牌被宠物名/称号压住**"
+                                    "（真机 2026-10-14 实证：被挡时最佳分就落在这段）——"
+                                    "看 debug/nt_miss_*.png 一眼分辨"
                                     if _near else
-                                    "**离阈值很远**，多半是名牌被挡住、或位置/模板根本不对")
+                                    "**离阈值很远** ⇒ 名牌多半**根本没画出来**"
+                                    "（被宠物名/称号盖住、或爬梯时不画），或位置/模板不对")
                         _body = f"本帧 {_s:.4f} / 近段最低 {_best:.4f}"
                     else:
                         _verdict = "**取不到匹配分数**（本次没有可用的匹配结果）"
@@ -4849,6 +7245,23 @@ class MapleStoryAutoBot:
             # 记下本帧全局 x，供下一帧比较（见上）
             if _gx:
                 self._ladder_gx = _gx
+            # ── 竖向进展戳（2026-10-14 加，用户拍板 A）—— 让路判据的唯一喂点 ──
+            # 只认**小地图全局 y 变化**，不用屏幕 y：
+            #   · 示范录制 46 个"整段没动"的梯上段共 1004 帧，全局 y 变化次数
+            #     **恰好为 0** ⇒ 零误报；
+            #   · 屏幕 y 不行：粘滞段仍有 4.9% 的帧 |Δy|≥3、33% 的帧 ≥1（±1~2px
+            #     抖动）⇒ 会把窗口不断重置，旗标永远清不掉（探针 _probe_ladder_yield2
+            #     实测：真爬段 ≥3 占 32.1% vs 粘滞段 4.9%，单帧阈值分不开）。
+            # 真爬段全局 y 变化间隔 p50=8 / p90=10 帧（27.7fps）⇒ 默认 0.7s 窗口够。
+            # ⚠️ 本戳与旗标本身**解耦**：不因为"过期"就把 is_on_ladder 清掉 ——
+            #   那面旗子还有 5 处消费点（靠边/锁定/掉梯保护），清掉会牵动路线行为。
+            #   这里只影响"要不要给梯子让路"，改动面最小（用户拍板 A 的落地口径）。
+            _gy_now = int(_gx[1]) if _gx else None
+            if (_gy_now is not None and self._ladder_gy is not None
+                    and _gy_now != self._ladder_gy):
+                self.t_ladder_move = time.time()
+            if _gy_now is not None:
+                self._ladder_gy = _gy_now
             # logger.info((self.is_on_ladder, dx, dy))
             # Update player location
             self.loc_player = loc_player
@@ -4917,6 +7330,8 @@ class MapleStoryAutoBot:
                 f" 指令({self.cmd_move_x} {self.cmd_move_y} {self.cmd_action})"
                 f" 怪{len(self.monsters)}"
                 f" 名字命中{self.nametag_hit}(miss{self.nametag_miss_streak})")
+            # 2026-10-14 加：[出招] 心跳（纯观测，紧跟 [运行状态] 的 5 秒节拍）
+            self._log_attack_heartbeat()
 
         # ── 性能埋点：紧跟 [运行状态]，同样每 5 秒一条 ─────────────────
         # 位置有讲究：必须在「关掉可视化就提前 return」**之前** —— 这次排查

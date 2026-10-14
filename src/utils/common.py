@@ -251,7 +251,7 @@ def nms(monsters, iou_threshold=0.3):
     - monsters: List of dictionaries, each representing a detected monster with:
         - "position": (x, y) top-left corner
         - "size": (width, height)
-        - "score": similarity/confidence score from template matching
+        - "score": template matching score; **越小越好**（TM_SQDIFF_NORMED，0 = 完全一致）
     - iou_threshold: Float, intersection-over-union threshold to suppress overlapping boxes
 
     Returns:
@@ -264,8 +264,15 @@ def nms(monsters, iou_threshold=0.3):
         # [x1, y1, x2, y2, score, original_data]
         boxes.append([x, y, x + w, y + h, m["score"], m])
 
-    # Sort by score descending
-    boxes.sort(key=lambda x: x[4], reverse=True)
+    # ★ 2026-10-14 改：按 score **升序**（越小越好）。
+    #   `score` 是 `TM_SQDIFF_NORMED` 的返回值（0 = 完全一致）⇒ 最优是**最小**的。
+    #   原来写的是 reverse=True（降序），于是同一簇重叠框里被留下的是**最差**那个；
+    #   更糟的是 `with_enemy_hp_bar` 分支给血条框的 score 固定 `1.0`（最差），
+    #   降序下血条框会压过真正匹配上的模板框。参考项目
+    #   zhoufanglu/maplestory-auto-ds 的 `nms` 也是升序。
+    #   ⚠️ 改动只影响"同簇里哪个框/哪个分数存活"，不影响框的数量级。
+    #   用户拍板 2026-10-14：「升序」。
+    boxes.sort(key=lambda x: x[4])
 
     keep = []
     while boxes:
@@ -579,6 +586,32 @@ def get_mask(img, ignore_pixel_color):
     mask = np.all(img == ignore_pixel_color, axis=2).astype(np.uint8) * 255
     mask = cv2.bitwise_not(mask)
     return mask
+
+def flatten_alpha_to_green(img, bg_color=(0, 255, 0), alpha_thres=128):
+    '''把带 alpha 通道的图（官方素材常见的 RGBA 透明底 PNG）压成 3 通道 BGR，
+    透明像素填成**绿幕** `bg_color`。
+
+    ⚠️ 为什么填绿、不填黑（2026-10-13 从参考项目 maplestory-auto-ds 借 alpha 支持时定的）：
+       参考项目 `MonsterDetector._load_monster_template` 把 alpha 外的像素置成
+       `[0,0,0]`（黑）。本引擎照抄会**踩坑**：默认模式 `contour_only` 的"轮廓"就是
+       黑像素，模板背景一旦是黑，整块背景立刻变成轮廓 ⇒ 等于给每张模板加了一个巨大
+       的假轮廓（误报立刻变多）。填绿则与本引擎「绿幕 = 背景」的既有约定
+       （`get_mask(img, (0, 255, 0))`）一致，contour_only 只看怪自己身上的黑线。
+
+    返回：3 通道 BGR `np.ndarray`（原图是 3 通道时**原样返回**，不做拷贝）。
+    形状不认识时抛 ValueError —— 由调用方决定"跳过这一张 + 记 ERROR"，不静默。
+    '''
+    if img is None:
+        raise ValueError("flatten_alpha_to_green got None")
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.ndim == 3 and img.shape[2] == 3:
+        return img
+    if img.ndim == 3 and img.shape[2] == 4:
+        bgr = np.ascontiguousarray(img[:, :, :3])
+        bgr[img[:, :, 3] < alpha_thres] = bg_color
+        return bgr
+    raise ValueError(f"unsupported image shape: {img.shape}")
 
 def to_opencv_hsv(color_hsv):
     """
@@ -1113,6 +1146,37 @@ def click_in_game_window(window_title, coord, button="left", clicks=1):
                      f"客户区 {tuple(coord)} -> 屏幕 {loc_click}")
     return ok
 
+def route_size_mismatch(size, ref_size) -> bool:
+    """
+    这张路线图（或回正线图）与**参考图**（minimaps/<地图>/map.png）尺寸是否不一致。
+
+    ⚠️ 2026-10-14 真机事故后加的（手绘回正线面板打不开）：
+        IndexError: boolean index did not match indexed array along axis 1;
+        size of axis is 344 but size of corresponding boolean axis is 268
+    真因：minimaps/废弃地铁2 里混着**两次不同小地图尺寸**录出来的文件 ——
+    map.png 137x344（当次）、route3..route7 也是 137x344，
+    但 route1 137x268、route2 137x319 是另一次录制的遗留。
+
+    为什么尺寸不同就**不能用**：map.png 是整张小地图全景，录制器拿它当坐标系
+    （`get_player_location_on_global_map()` = `find_pattern_sqdiff(self.img_map,
+    self.img_minimap)` + 小地图上的角色点 + offset），路线图上的像素就是这套坐标。
+    尺寸不一样 ⇒ **刻度不一样**，不是"图糊了"：拿它当主线参考（手绘面板）会错位，
+    让引擎按它走会**走到错的地方**，而且都不报错。所以判据只有一条：尺寸必须一致；
+    不一致的**跳过 + 明确报出来**（fail-closed，见引擎 `load_config` 与
+    `tools/homeRouteDrawer.py` 的两处调用点）。
+
+    只比 shape[:2]（高、宽），不比对内容 —— 内容有差异是正常的（不同次的录制）。
+
+    Args:
+        size: 待检查图的 shape（或 (h, w) 元组）
+        ref_size: 参考图的 shape（或 (h, w) 元组）
+
+    Returns:
+        bool: True = 尺寸不一致（这张图不能用）
+    """
+    return tuple(size[:2]) != tuple(ref_size[:2])
+
+
 def mask_route_colors(img_map, img_route, color_code):
     """
     Masks all pixels in img_route where img_map contains any route color.
@@ -1396,6 +1460,294 @@ def route_too_narrow_for_patrol(goal_gap, min_gap) -> bool:
     if g <= 0 or m <= 0:
         return False
     return g < m
+
+
+def nametag_relax_decision(score, thres, ratio, max_jump, cand, anchor):
+    '''名字定位「抗闪」判据（2026-10-14 加）—— **只有这一处**，引擎与自检共用。
+
+    病根（用户真机日志 2026-10-14 11:42，`log/MSBot_2026-10-14_11-42-16.log`）：
+    名字匹配的分数是**双峰**的 ——
+      · 认得出的帧 0.0000~0.0057（配置里 2026-09-10 的标定值；本次真机"近段最低 0.0009"）
+      · 认不出的帧 0.0220~0.0240，正好卡在 `diff_thres: 0.01` **之上**
+      · 而配置注释里记录的"完全失配 / 已知假阳性"是 0.033~0.047
+    ⇒ 0.022~0.024 这一档既不是"完全没匹配上"，也不够干净，多半是名牌被挡了一部分
+    （切块兜底 `split_width_fallback: 30` 也没救回来）。
+
+    真正的危害不是"位置错"，而是 `nametag_miss_streak` 一路涨过
+    `stale_pos_full_frame_after`（当时是 10；2026-10-14 当天先后试过 25 与 10，
+    最终按用户拍板设为 **0 = 关掉整帧放大**）
+    ⇒ **索敌框放大到整帧** ⇒ 怪数虚高（真机 怪8~怪10，
+    正常 怪0~怪2）、去追画面外 550px 的目标（感知框 ±330 根本看不到）。
+
+    判据（**两条同时满足**才采信这一帧）：
+      ① 分数 < `thres * ratio`（`ratio <= 1` 直接关掉本功能）；
+      ② 候选角色位置离**上一次严格命中**的锚点曼哈顿距离 <= `max_jump`。
+    ②是安全阀，理由沿用配置注释里的口径："认错 = 位置错（危害大），不认 = 沿用上一帧
+    位置（几乎无害）" ⇒ 放宽必须**有界**：最坏后果只是"锚点附近 max_jump 像素内的偏移"，
+    而不是"框到别处去"（那才会让索敌框/攻击框整体错位）。
+    ⚠️ 锚点必须始终是**严格命中**的位置，**不能**用上次放宽采信的位置 ——
+       否则每帧都能挪 max_jump，连成一串就把位置链式带跑了。
+
+    Args:
+        score: 本次匹配分（SQDIFF_NORMED，0=完全一样，越小越像）
+        thres: `nametag.diff_thres`（严格阈值）
+        ratio: `nametag.relax_ratio`（<=1 表示关闭本功能）
+        max_jump: `nametag.relax_max_jump`（像素）
+        cand: 本次算出的**角色位置** (x, y)（已过画面外假命中护栏）
+        anchor: 上次**严格命中**的角色位置 (x, y)；没有就传 None
+
+    Returns:
+        (bool, str, int | None): (是否采信, 人话原因, 与锚点的距离或 None)
+    '''
+    try:
+        _score = float(score)
+        _thres = float(thres)
+        _ratio = float(ratio)
+    except (TypeError, ValueError):
+        return False, "分数/阈值/放宽倍数不可用", None
+    if _ratio <= 1.0:
+        return False, "放宽已关闭（relax_ratio <= 1）", None
+    _cap = _thres * _ratio
+    if not _score < _cap:
+        return False, f"分数 {_score:.4f} 连放宽上限 {_cap:.4f} 都没过", None
+    if cand is None or anchor is None:
+        return False, "还没有过严格命中，没有可比对的锚点", None
+    try:
+        _d = abs(int(cand[0]) - int(anchor[0])) + abs(int(cand[1]) - int(anchor[1]))
+        _jump = int(max_jump)
+    except (TypeError, ValueError, IndexError):
+        return False, "位置/距离不可用", None
+    if _d > _jump:
+        return False, (f"分数 {_score:.4f} 在放宽上限 {_cap:.4f} 内，"
+                       f"但位置离上次严格命中 {_d}px > {_jump}px"), _d
+    return True, (f"分数 {_score:.4f} 超过严格阈值 {_thres:g}"
+                  f"（放宽 ×{_ratio:g}，上限 {_cap:.4f}），"
+                  f"但位置离上次严格命中只差 {_d}px（≤{_jump}）"), _d
+
+
+def mob_no_attack_reason(kind, engage_n=0, far_n=0, half_x=0, half_y=0,
+                         approach=True, stop_to_attack=True, front=None,
+                         cooldown_left=0.0,
+                         gap_area=None, gap_need=None, gap_dx=0, gap_dy=0,
+                         center_in=0):
+    '''「画面里有怪、这一帧却没出招」的**归因文案**（2026-10-14 加；纯函数 → 可离线单测）。
+
+    治的是什么（用户真机反馈 m05740「有检测框、也在攻击范围内，但是没有立马攻击」）：
+        画出来的框是**索敌框**（`get_search_box()` = 攻击框 + `search_box_margin`
+        之后再乘 `detect_range_scale`：默认 2.0、用户侧 1.5 ⇒ 横向 ±330px / 纵向
+        ±132px；位置连续丢失 `stale_pos_full_frame_after` 帧时直接放大到**整帧**），
+        而出招只看**攻击框**（`get_attack_range()` = `aoe_skill.range_x/y ÷ 2` ⇒
+        ±170×±70），并且要求与怪框的交叠面积 `>= _min_mob_area()`。
+        两个框差着一大截 ⇒ **「框画出来了」只证明"看见了"，不证明"够得着"** ——
+        真机日志 `[靠近] …最近的在left侧 176px` 正是这一类（机器人在**走过去**打，
+        不是站着打）。
+    为什么需要这一行：散在 6 个分支里的 `return` 各自都合理，但用户从日志里读不出
+        "这一帧为什么没出招"。只有把**本帧的事实**（框内几个 / 框外几个 / 两个开关 /
+        前台 / 冷却）汇总成一行，才能一眼分清「引擎认为够不着」「在爬绳/让路」
+        「窗口没在前台」「冷却没到」这四种完全不同的处境。
+
+    ⚠️ 纯观测：本函数的返回值**只进日志**，不参与任何判定（改它不会改行为）。
+    ⚠️ 三态：`front=None` = **查不到**（键盘控制器还没起 / 查询失败），必须与
+       `front=False`（确认不在前台）分开说 —— 别把"不知道"写成"正常"
+       （`03 §6` 教训 3：区分"没发生"和"没观测"）。
+
+    Args:
+        kind (str): 'front' | 'no_engage' | 'approach_pending' | 'approach_off'
+            | 'cooldown' | 'direction'。未知取值 ⇒ 归一成 'unknown'（**不抛异常**：
+            日志文案不该把主循环带崩）。
+        engage_n (int): 攻击框内的目标数（"够得着"的那批）。
+        far_n (int): 索敌框内、攻击框外的目标数（"看得见够不着"的那批）。
+        half_x, half_y (int): 攻击框半宽/半高（像素），只进文案。
+        approach (bool): `monster_detect.approach_mob`（要不要"走过去打"）。
+        stop_to_attack (bool): `monster_detect.stop_to_attack`（要不要"停下来打"）。
+        front (bool | None): 游戏窗口是否在前台；None = 未知。
+        cooldown_left (float): 攻击冷却剩余秒数（kind='cooldown' 时用）。
+        gap_area (int | None): 离"算够得着"**最近的那一只**与攻击框的交叠面积（px²）。
+            None = 这一帧没算（就不打这段）。★ 2026-10-14 加：用户 m06668
+            「红色攻击框里有绿色的检测框，但是就是不攻击」—— 只说"框外有几个"
+            分不清「差 1px」（判据太严，该放宽）和「差 300px」（画出来的是索敌框，
+            本来就不该打）。给出数字才分得清。
+        gap_need (int | None): 那只怪"算够得着"需要的交叠面积（= `_min_mob_area()`，
+            本图**最小**那张模板的面积）—— 对小怪意味着"必须几乎完全落在攻击框里"。
+        gap_dx, gap_dy (int): 那只怪的中心离攻击框的水平/垂直距离（已在框内 = 0）。
+        center_in (int): 怪框**中心**已经落在攻击框内的目标数（判据与直觉是否一致的
+            唯一证据：中心都在框里却仍不算够得着 ⇒ 判据偏严）。
+
+    Returns:
+        (str, str): (归一化后的 code, 整行正文)。正文**不含** `[没出招·归因] ` 前缀。
+    '''
+    _k = str(kind)
+    if _k not in ("front", "no_engage", "approach_pending", "approach_off",
+                  "cooldown", "direction", "home_route"):
+        _k = "unknown"
+
+    def _i(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    _eng, _far = _i(engage_n), _i(far_n)
+    _tot = _eng + _far
+    _hx, _hy = _i(half_x), _i(half_y)
+    _sw = (f"stop_to_attack={'开' if stop_to_attack else '关'}"
+           f" / approach_mob={'开' if approach else '关'}")
+    _fr = ("前台=**未知**" if front is None
+           else ("前台=在前台" if front else "前台=**不在前台**"))
+    _facts = f"（攻击框 ±{_hx}×±{_hy}px，画面 {_tot} 个目标；{_sw}；{_fr}）"
+
+    if _k == "front":
+        _body = ("游戏窗口不在前台 ⇒ 引擎照旧检测、照旧画框，但键盘层**一个键都不发**"
+                 "（把游戏窗口点到最前；本项目界面自己在前台时也算「不在前台」，"
+                 "因为它标题里含游戏标题）")
+    elif _k == "no_engage":
+        _tail = ("；正在走过去打，还没进框" if approach
+                 else "；approach_mob 关着 ⇒ 框外的一律不管")
+        _body = (f"攻击框里一个都没有：{_far} 个目标全在**攻击框外**"
+                 f"（画出来的框是索敌框，比攻击框大一圈）{_tail}")
+    elif _k == "approach_pending":
+        _body = (f"攻击框外有 {_far} 个目标，但本帧没追过去"
+                 f"（还没凑齐「连续两次都看见」的确认，或它们都在别的层 —— "
+                 f"|高差| > approach_dy_tol）⇒ 本帧不出招")
+    elif _k == "approach_off":
+        _body = (f"attack 框外有 {_far} 个目标，但 approach_mob 关着 ⇒ "
+                 f"只打框内的，框外的一律不管（这不是故障，是配置）")
+    elif _k == "cooldown":
+        if _eng > 0:
+            _body = (f"攻击框里有 {_eng} 个目标，但攻击冷却还剩 {float(cooldown_left):.2f}s "
+                     f"⇒ 冷却一到就出招")
+        else:
+            _body = (f"锁定中的目标暂时不在攻击框里（正在锁定补招），"
+                     f"攻击冷却还剩 {float(cooldown_left):.2f}s")
+    elif _k == "home_route":
+        _body = ("正在走回正线（从平台掉下去之后先回到主线上）⇒ 回正期间怪逻辑"
+                 "**完全不碰**走位与动作，看见怪也不打 —— 回到主线后立刻恢复")
+    elif _k == "direction":
+        _body = (f"攻击框里有 {_eng} 个目标，但 directional 判不出攻击方向"
+                 f"（怪在正上/正下，或左右两侧一样近）⇒ 本帧不出招")
+    else:
+        _body = (f"原因未知（kind={kind!r}）：这一帧没出招，但没匹配到已知归因 —— "
+                 f"请把本行连同前后的日志一起发给开发者")
+    # ── 离「算够得着」最近的那一只差多少（2026-10-14 加，用户 m06668）────────
+    #    为什么要数字：归因只说"框外有几个"，而"够不着"有三种完全不同的处境 ——
+    #      ① 差一点点 ⇒ 交叠判据太严（最小模板的**整个**面积才算 ⇒ 体型最小的怪
+    #         必须完全落在攻击框里），该放宽；
+    #      ② **中心已经在攻击框里**却仍不算 ⇒ 判据与人的直觉不一致（最该看的一档）；
+    #      ③ 差得远 ⇒ 画出来的是索敌框，本来就不该打（预期行为）。
+    #    ⚠️ 纯观测：算不出来/参数非法 ⇒ 一个字都不加，绝不影响正文。
+    _gap = ""
+    try:
+        if gap_need:
+            _ga, _gn = _i(gap_area), _i(gap_need)
+            _gdx, _gdy, _gci = _i(gap_dx), _i(gap_dy), _i(center_in)
+            _dxy = (f"，中心离攻击框 {_gdx}px 水平 / {_gdy}px 垂直"
+                    if (_gdx or _gdy) else "，中心已在攻击框内")
+            _gap = (f"；离「算够得着」最近的一只：交叠 {_ga}/{_gn} px²"
+                    f"（还差 {max(0, _gn - _ga)}{_dxy}；"
+                    f"中心已在攻击框内的有 {_gci} 个）")
+    except (TypeError, ValueError):
+        _gap = ""
+    return _k, _body + _gap + _facts
+
+
+def monster_box_detail(pos, size, box):
+    '''一只怪相对攻击框的一句话明细（纯函数 → 可离线单测）。
+
+    格式：`(cx,cy) WxH 交叠A 中心∈框` / `… 中心外 40px×0px↓`
+    （中心在框内时不写距离与箭头；`A` = 与该框的交叠面积 px²，
+    门槛由整行的表头统一给出，不逐只重复。）
+    算不出来 ⇒ 返回 `(?)`，**绝不抛异常**（这是观测行，不能带崩主循环）。
+    '''
+    try:
+        _x, _y = int(pos[0]), int(pos[1])
+        _w, _h = int(size[0]), int(size[1])
+        _cx, _cy = _x + _w // 2, _y + _h // 2
+        _bx0, _by0, _bx1, _by1 = (int(box[0]), int(box[1]),
+                                  int(box[2]), int(box[3]))
+        _iw = max(0, min(_bx1, _x + _w) - max(_bx0, _x))
+        _ih = max(0, min(_by1, _y + _h) - max(_by0, _y))
+        _dx = int(max(_bx0 - _cx, 0, _cx - _bx1))
+        _dy = int(max(_by0 - _cy, 0, _cy - _by1))
+        if _dx == 0 and _dy == 0:
+            _where = "中心∈框"
+        else:
+            _arrow = ""
+            if _dy:
+                _arrow += "↑" if _cy < _by0 else "↓"
+            if _dx:
+                _arrow += "←" if _cx < _bx0 else "→"
+            _where = f"中心外 {_dx}px×{_dy}px{_arrow}"
+        return f"({_cx},{_cy}) {_w}×{_h} 交叠{_iw * _ih} {_where}"
+    except (TypeError, ValueError, IndexError):
+        return "(?)"
+
+
+def monster_detect_snapshot(engage, far, box=None, mode="center", need=0,
+                            detail_n=4, player=None, margin=0):
+    '''把**这一帧的怪检测结果**压成一行（纯函数 → 可离线单测）。
+
+    治的是什么（用户 m06852「记录下怪物的检测信息，现在的攻击还是不够灵敏」）：
+        `[运行状态]` 只写「怪N」，看不出**它在哪、为什么不算够得着**；
+        `[没出招·归因]` 只在"没出招"的帧打，出招的帧什么都看不到。
+        于是"够不够灵敏"没法证 —— 这一行补上：攻击框的**绝对坐标**、
+        引擎认为的**角色位置**、以及每只怪的中心/尺寸/交叠/中心离框多远。
+
+    Args:
+        engage (list[dict]): **攻击框内**的怪（调用方用 `_mobs_in_attack_box()`
+            分好类 —— 本函数**不重新判定**，避免出现第二套判据）。
+        far (list[dict]): 检出了、但不在攻击框内的怪。
+        box (tuple | None): 攻击框 (x0, y0, x1, y1)；None ⇒ 不写坐标段。
+        mode (str): 当前判据名（`center` / `min_area`）。
+        need (int): `_min_mob_area()`（"算够得着"需要的交叠面积）。
+        detail_n (int): 明细最多列几只（先列框内的，再列框外交叠最大的）。
+        player (tuple | None): 引擎认为的角色位置 (x, y)。
+        margin (int): 判定用的「宽判定」余量（`monster_detect.mob_engage_margin`，
+            px）。`box` 是**已经加过余量**的框；这里只把它写进文案，免得日志说
+            "框在这儿"、读者却拿它与技能真实范围对不上号。0/畸形 ⇒ 不写这一段。
+
+    Returns:
+        str: 整行正文（**不含** `[怪检测] ` 前缀）。
+    '''
+    _eng = list(engage or [])
+    _far = list(far or [])
+    _box = None
+    if box is not None:
+        try:
+            _box = (int(box[0]), int(box[1]), int(box[2]), int(box[3]))
+        except (TypeError, ValueError, IndexError):
+            _box = None
+    _head = (f"检出 {len(_eng) + len(_far)} 只 | 攻击框内 {len(_eng)} / 框外 "
+             f"{len(_far)} | 判据 {mode}")
+    if _box is not None:
+        _head += (f"（门槛 {int(need)}px²）| 攻击框 x[{_box[0]},{_box[2]}] "
+                  f"y[{_box[1]},{_box[3]}]"
+                  f"（±{(_box[2] - _box[0]) // 2}×±{(_box[3] - _box[1]) // 2}）")
+        try:
+            _mg = int(margin or 0)
+        except (TypeError, ValueError):
+            _mg = 0
+        if _mg:
+            _head += (f"＋宽判定余量 {_mg}px（上面这个框已向外各扩 {_mg}px；"
+                      f"屏幕上画的仍是技能真实框）")
+    if player is not None:
+        try:
+            _head += f" | 角色({int(player[0])},{int(player[1])})"
+        except (TypeError, ValueError, IndexError):
+            pass
+    # 明细：框内的在前（那是"正在打"的），框外按交叠从大到小（那是"最近够得着"的）
+    _items = [(_m, True) for _m in _eng] + [(_m, False) for _m in _far]
+    _parts = []
+    for _n, (_m, _in) in enumerate(_items[:max(0, int(detail_n))]):
+        try:
+            _d = monster_box_detail(_m["position"], _m["size"], _box or (0, 0, 0, 0))
+        except (TypeError, KeyError):
+            _d = "(?)"
+        _parts.append(f"{'★' if _in else '·'}{_n + 1}{_d}")
+    _detail = ("；明细 " + " ".join(_parts)) if _parts else ""
+    _more = ""
+    if len(_items) > max(0, int(detail_n)):
+        _more = f"（还有 {len(_items) - max(0, int(detail_n))} 只没列）"
+    return _head + _detail + _more
 
 
 def monster_detect_interval(cfg) -> int:

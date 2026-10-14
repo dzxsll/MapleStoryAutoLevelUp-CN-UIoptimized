@@ -75,6 +75,17 @@ def make_stub(cfg, loc_player):
     s._turn_frames_left = 0
     s._turn_dir = None
     s.img_frame = None
+    # ★ 2026-10-13：`get_nearest_monster` 把原来就地算的「最小怪面积」抽成了
+    #   `_min_mob_area()`，本文件是**不绑方法**、直接 `MapleStoryAutoBot.xxx(st, ...)`
+    #   的写法 ⇒ 必须把新方法绑到桩上，否则实跑直接
+    #   `AttributeError: 'S' object has no attribute '_min_mob_area'`。
+    #   顺带把感知框那两个也绑上（同一次改动引入，后面用例可能会用到）。
+    from src.engine.MapleStoryAutoLevelUp import MapleStoryAutoBot as _Bot
+    for _n in ("_min_mob_area", "get_detect_extent", "get_search_box"):
+        try:
+            setattr(s, _n, getattr(_Bot, _n).__get__(s))
+        except AttributeError:
+            pass
     return s
 
 

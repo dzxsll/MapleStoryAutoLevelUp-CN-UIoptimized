@@ -37,7 +37,7 @@ if REPO_ROOT not in sys.path:
 import src.engine.MapleStoryAutoLevelUp as eng          # noqa: E402
 from src.utils.common import (load_yaml, override_cfg,   # noqa: E402
                               load_image, crop_frame_to_client,
-                              imread_unicode, imwrite_unicode)
+                              imread_unicode, imwrite_unicode, flatten_alpha_to_green)
 
 OUT_DIR = os.path.join(REPO_ROOT, "debug")
 
@@ -50,10 +50,40 @@ def load_cfg():
     return cfg
 
 
-def build_monster_templates(only=None):
-    """按引擎 load_config 同款方式加载 monster/ 下全部模板（含自动水平翻转）。"""
-    import yaml
+def build_monster_templates(only=None, cfg=None, from_dir=None):
+    """按引擎 load_config **同款方式**加载模板（含多尺度 scales + 自动水平翻转）。
+
+    ⚠️ 2026-10-14 修：原来这里自己写了一套 load_image + get_mask + flip。
+       引擎改成「IMREAD_UNCHANGED + flatten_alpha_to_green + _mob_template_variants」
+       之后，这里没跟着改 ⇒ 验证器与引擎**判据不一致**：
+       透明底素材在本工具里透明区被读成**黑**（IMREAD_COLOR 丢 alpha），
+       contour_only 模式下整张矩形都算轮廓 ⇒ 验证结果和挂机时的真实行为对不上。
+       现在改为直接调引擎那两个方法（单一权威源）。
+    """
     info = {}
+    scales = eng.MapleStoryAutoBot._mob_scales((cfg or {}).get("monster_detect"))
+    if from_dir:
+        # 外部素材目录（例如从 maplestory.wiki 下回来的官方 PNG）：
+        # 每个目录当成一种怪，名字取目录名 —— 用来跟仓库里现用的模板做 A/B。
+        # 支持逗号分隔多个目录（比如「官方素材 + 仓库现用」合起来看覆盖率）。
+        for one in [s.strip() for s in from_dir.split(",") if s.strip()]:
+            if not os.path.isabs(one):
+                one = os.path.join(REPO_ROOT, one)
+            name = os.path.basename(os.path.normpath(one))
+            imgs = []
+            for file in sorted(glob.glob(os.path.join(one, "*.png"))):
+                try:
+                    raw = load_image(file, cv2.IMREAD_UNCHANGED)
+                    imgs.extend(eng.MapleStoryAutoBot._mob_template_variants(
+                        flatten_alpha_to_green(raw), scales))
+                except Exception as e:                              # noqa: BLE001
+                    print(f"  [跳过] {os.path.basename(file)}：{e!r}")
+            if imgs:
+                info[name] = imgs
+            else:
+                print(f"  [警告] 目录里没有可用 PNG：{one}")
+        return info
+
     base = os.path.join(REPO_ROOT, "monster")
     for d in sorted(os.listdir(base)):
         p = os.path.join(base, d)
@@ -63,10 +93,12 @@ def build_monster_templates(only=None):
             continue
         imgs = []
         for file in sorted(glob.glob(os.path.join(p, f"{d}*.png"))):
-            img = load_image(file)
-            imgs.append((img, eng.get_mask(img, (0, 255, 0))))
-            flip = cv2.flip(img, 1)     # 引擎同款：自动加水平翻转（怪朝向兼容）
-            imgs.append((flip, eng.get_mask(flip, (0, 255, 0))))
+            try:
+                raw = load_image(file, cv2.IMREAD_UNCHANGED)
+                imgs.extend(eng.MapleStoryAutoBot._mob_template_variants(
+                    flatten_alpha_to_green(raw), scales))
+            except Exception as e:                                  # noqa: BLE001
+                print(f"  [跳过] {os.path.basename(file)}：{e!r}")
         if imgs:
             info[d] = imgs
     return info
@@ -97,14 +129,21 @@ def main():
     ap.add_argument("--only", default=None, help="只验证这一种怪的模板（默认全部）")
     ap.add_argument("--thres", type=float, default=None,
                     help="临时覆盖 monster_detect.diff_thres（默认读配置 0.01）")
+    ap.add_argument("--from", dest="from_dir", default=None,
+                    help="模板目录覆盖：把这个目录里的 *.png 当成一种怪来验证"
+                         "（例如官方素材 D:\\Download\\Ligator），不动仓库里的模板")
+    ap.add_argument("--scales", default=None,
+                    help="临时覆盖 monster_detect.scales，如 1.0 或 0.7,0.85,1.0,1.15")
     a = ap.parse_args()
 
     cfg = load_cfg()
     if a.thres is not None:
         cfg["monster_detect"]["diff_thres"] = a.thres
+    if a.scales:
+        cfg["monster_detect"]["scales"] = [float(s) for s in a.scales.split(",") if s.strip()]
     thres = cfg["monster_detect"]["diff_thres"]
 
-    templates = build_monster_templates(a.only)
+    templates = build_monster_templates(a.only, cfg=cfg, from_dir=a.from_dir)
     if not templates:
         print("[错误] monster/ 下没有模板。先用主界面 F3 截取。")
         return 2
@@ -128,7 +167,14 @@ def main():
     print("=" * 76)
     print(" 怪物模板离线验证（与引擎同逻辑：轮廓匹配 + NMS）")
     print("=" * 76)
-    print(f" 模板: " + ", ".join(f"{k}({len(v)}帧含翻转)" for k, v in templates.items()))
+    print(f" 模板: " + ", ".join(f"{k}({len(v)}帧=原图×镜像×尺度)" for k, v in templates.items()))
+    print(f" 模式: {cfg['monster_detect']['mode']}   "
+          f"scales: {cfg['monster_detect'].get('scales', [1.0])}   "
+          f"色校验: {bool(cfg['monster_detect'].get('verify_color', True))}"
+          f"(tol={cfg['monster_detect'].get('verify_color_tol', 30)}, "
+          f"min_ratio={cfg['monster_detect'].get('verify_min_ratio', 0.75)})")
+    if a.from_dir:
+        print(f" ⚠️ 模板目录覆盖自: {a.from_dir}（仓库里的 monster/ 未被使用）")
     print(f" 判定阈值 score < {thres}   留档帧 {len(paths)} 张（跑最近 {min(len(paths), a.frames or len(paths))} 张）")
     print()
 

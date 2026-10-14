@@ -51,7 +51,29 @@ def make_stub(cfg, loc_player, monsters, **kw):
     s = S()
     for _name in ("get_attack_range", "get_nearest_monster",
                   "get_attack_direction", "update_cmd_by_mob_detection",
-                  "get_face_direction"):
+                  "get_face_direction",
+                  # 2026-10-13 加：感知框/攻击框分开 —— 索敌框改由 get_search_box 出，
+                  # 攻击判定走 _mobs_in_attack_box（内部用 _min_mob_area）
+                  "get_detect_extent", "get_search_box",
+                  "_min_mob_area", "_mobs_in_attack_box",
+                  # 2026-10-14 加：「没出招·归因」纯观测日志（读攻击框尺寸与前台状态）
+                  "_attack_box_half", "_game_window_front", "_mob_no_attack_log",
+                  # 2026-10-14 加：[出招] 计数（4 处出招都调它，纯观测）
+                  "_note_attack", "_log_attack_heartbeat",
+                  # 2026-10-14 加：「离够得着最近的一只差多少」（归因行里的数字）
+                  "_engage_gap", "_engage_gap_facts",
+               # 2026-10-14 加：[怪检测] 明细行（纯观测；它要读判据名与攻击框）
+               "_engage_mode", "_log_monster_detect",
+
+               # 2026-10-14 加：梯上让路收紧（`update_cmd_by_mob_detection` 的让路块只问它）
+
+               # 2026-10-14 加「宽判定余量」（B）：唯一读点 + 唯一拼框点
+
+
+               "_engage_margin", "_attack_boxes",
+
+
+               "_ladder_still_s", "_ladder_yield"):
         setattr(s, _name, getattr(MapleStoryAutoBot, _name).__get__(s))
     s.cfg = cfg
     s.loc_player = loc_player
@@ -95,7 +117,11 @@ def base_cfg():
         "bot": {"attack": "directional"},
         "monster_detect": {"search_box_margin": 50, "max_mob_area_trigger": 1500,
                            "mode": "contour_only", "contour_blur": 5,
-                           "diff_thres": 0.8, "with_enemy_hp_bar": False},
+                           "diff_thres": 0.8, "with_enemy_hp_bar": False,
+                           # ★ 2026-10-14：宽判定余量在本文件里关掉 —— 本文件钉的是
+                           #   "两侧都有怪时选近的打"的几何，余量会把期望挪 40px。
+                           #   余量自己的行为在 tools/verify_engage_margin.py 里钉。
+                           "mob_engage_margin": 0},
         "character": {"width": 100, "height": 150},
         "directional_attack": {"range_x": 350, "range_y": 70,
                                "cooldown": 0.9, "turn_frames": 3},

@@ -38,10 +38,16 @@ def check(name, got, want):
         FAIL.append(name)
 
 
-def new_recorder(jump_key="space"):
-    '''造一个**只带必要字段**的录制器（不跑 GUI / 不连游戏）。'''
+def new_recorder(jump_key="space", teleport_key=None):
+    '''造一个**只带必要字段**的录制器（不跑 GUI / 不连游戏）。
+
+    teleport_key=None ⇒ 保留 config_default.yaml 里的原值（"e"，正是老的写死值），
+    这样"没设过 key.teleport"的老用例行为不变。
+    '''
     cfg = load_yaml("config/config_default.yaml")
     cfg.setdefault("key", {})["jump"] = jump_key
+    if teleport_key is not None:
+        cfg.setdefault("key", {})["teleport"] = teleport_key
     r = RouteRecorder.__new__(RouteRecorder)
     r.cfg = cfg
     # ⚠️ 必须和真实录制器一致：**两张表合并**进 self.color_code
@@ -306,6 +312,46 @@ _legacy_blocked = bool(_cfg_default) and os.path.exists(
 check("③ 不传 --cfg 时不能落到 config_custom.yaml（方案必须生效）",
       _legacy_blocked, False)
 print(f"     当前环境中 active_config_path() = {_ap}")
+
+print("\n【7】★ 瞬移键也必须读配置（2026-10-14 修：jump_key 的同类 bug 当时漏修）")
+# ══════════════════════════════════════════════════════════════════════
+# 真机反例：config `key.teleport: space`，用户录制时按 空格+方向 想录瞬移，
+#   而录制器里写死了 `"e" in key_press` ⇒ 一路落到末尾返回 ("", False)
+#   ⇒ **一个传送像素都不画，全程静默**（引擎侧 4 个 teleport 色码本来全支持）。
+# 本节点钉两件事：① 瞬移键从配置读；② 老默认值 "e" 的行为不能变。
+# ⚠️ 这里**不加**"源码里不许出现写死 e"的字符串判据：下面的 ② 与 ⑦ 是**行为判据**，
+#    写死 e 时必红；而字符串判据会被 docstring 里对旧写法的引用误伤
+#    （tools/verify_hotkey_f12_close.py 踩过这个 code_only 坑）。
+# ══════════════════════════════════════════════════════════════════════
+r_tp = new_recorder("c", teleport_key="space")
+check("① 瞬移键读自 config（teleport=space）", r_tp.teleport_key(), "space")
+check("★ ② space+左 → left none teleport（旧版写死 e 时这里会漏成 left 线）",
+      r_tp.action_from_keys(["space", "left"]), ("left none teleport", True))
+check("★ ③ space+右 → right none teleport",
+      r_tp.action_from_keys(["space", "right"]), ("right none teleport", True))
+check("★ ④ space+上 → none up teleport",
+      r_tp.action_from_keys(["space", "up"]), ("none up teleport", True))
+check("★ ⑤ space+下 → none down teleport",
+      r_tp.action_from_keys(["space", "down"]), ("none down teleport", True))
+check("⑥ space 单独（没有方向）→ 不画（色码表里没有'原地传送'）",
+      r_tp.action_from_keys(["space"]), ("", True))
+check("★ ⑦ 反向：瞬移键=space 时按 e 不算传送（写死 e 的回归会在这里红）",
+      r_tp.action_from_keys(["e", "left"]), ("left none none", False))
+check("⑧ 同时按跳跃键+瞬移键+右 → 跳优先（色码表没有'跳+传送'）",
+      r_tp.action_from_keys(["space", "right", "c"]), ("right none jump", True))
+
+r_tp_e = new_recorder("c", teleport_key="e")
+check("⑨ 老默认 teleport=e 时按 e → left none teleport（老行为不变）",
+      r_tp_e.action_from_keys(["e", "left"]), ("left none teleport", True))
+r_tp_up = new_recorder("c", teleport_key="  SPACE  ")
+check("⑩ 配置值带空格/大写 → 归一化成 'space'", r_tp_up.teleport_key(), "space")
+check("⑪ 归一化后仍认 space",
+      r_tp_up.action_from_keys(["space", "down"]), ("none down teleport", True))
+r_tp_none = new_recorder("c", teleport_key="")
+check("⑫ teleport 留空 → 回落 'e'（读不到也不能变成'谁都不认'）",
+      r_tp_none.teleport_key(), "e")
+check("⑬ 留空回落后按 e 仍能录传送（与 jump_key 同一条回落口径）",
+      r_tp_none.action_from_keys(["e", "right"]), ("right none teleport", True))
 
 print("\n" + "=" * 68)
 if FAIL:

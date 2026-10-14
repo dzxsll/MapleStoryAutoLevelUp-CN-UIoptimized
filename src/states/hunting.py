@@ -41,3 +41,9 @@ class HuntingState(State):
         # 供下一帧判断「是否已经转向」—— 见 update_cmd_by_mob_detection 的先转身后出招。
         # 必须在 set_command 之后更新，否则记到的是本帧被覆盖前的值。
         self.bot.cmd_move_x_last = self.bot.cmd_move_x
+
+        # ── 手动示范录制：本帧落一行（2026-10-14 加）───────────────────────
+        # 放在**最后**：此刻路线/打怪/卡死处理都跑完，`cmd_*` 是本帧最终决策，
+        # 录到的"影子决策"才是引擎本来会怎么打。没开录制时这行几乎零成本；
+        # 录制器自带 try/except（出错只吼一次并自己关掉，绝不影响挂机）。
+        self.bot.record_demo_frame()
