@@ -18,7 +18,9 @@ from PySide6.QtWidgets import (
     QCheckBox, QListWidget, QFileDialog, QHBoxLayout, QLineEdit,
     QPlainTextEdit, QTabWidget, QGroupBox, QFormLayout,
     QSizePolicy, QComboBox, QListWidgetItem, QScrollArea,
-    QInputDialog, QMessageBox, QDialog, QDialogButtonBox, QDoubleSpinBox
+    QInputDialog, QMessageBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    # ★ 2026-10-15：自动喝药面板的档位阈值编辑（用户 m12180「药水设置没法改」）
+    QSpinBox,
 )
 from PySide6.QtGui import QTextCharFormat, QColor, QTextCursor, QPixmap, QImage, QIcon
 from PySide6.QtCore import Qt, Signal, QTimer, QEvent, QProcess
@@ -95,7 +97,11 @@ ADV_FIELD_HIDE = {
     #    这里只放行 enabled / hp / mp / confirm_frames / *_cooldown_sec
     #    中"用户会改"的那几个，见 create_potion_gbox 的说明。
     #    ⚠️ 档位列表（hp/mp）是嵌套结构，高级设置页渲染不了，必须收起来。
-    'potion':         ['hp', 'mp'],
+    #    ★ 2026-10-15 加 'enabled'：总开关现在由**面板上的「启用自动喝药」复选框**
+    #      独占（它会把值写进 cfg 并立刻落盘，见 on_potion_toggled）。收起来是为了
+    #      满足下面那条不变量 —— 'enabled' 从此有主界面控件，就不该再在高级设置里
+    #      出现第二个同名控件（两处口径打架时，用户改的那个未必是生效的那个）。
+    'potion':         ['hp', 'mp', 'enabled'],
     'nametag':        ['mode', 'global_diff_thres', 'split_width',
                        # 抗闪（2026-10-14）：算法内部阈值，用户改只会把定位搞乱
                        'relax_ratio', 'relax_max_jump'],
@@ -767,6 +773,10 @@ class MainWindow(QMainWindow):
         self.cfg_base = load_yaml("config/config_default.yaml")
         self.cfg = copy.deepcopy(self.cfg_base)
         self.path_cfg_custom = "config/config_custom.yaml" # Custom config path
+        # ★ 2026-10-15：键级"脏标记"的基线（见 _merge_disk_owned_sections / _snapshot_cfg）。
+        #   空 dict = 退化成老行为（非托管段以磁盘为准），所以任何异常路径都不会更坏。
+        self._cfg_snapshot = {}
+        self._last_saved_at = ""
 
         # Load database
         self.data = load_yaml("config/config_data.yaml")
@@ -836,6 +846,11 @@ class MainWindow(QMainWindow):
         #   并据此改 self.cfg，先填控件就会填成过期的值；又必须在启动定时器之前，
         #   否则定时器仍可能抢在填值前跑一次。
         self.apply_config_to_ui()
+
+        # ★ 2026-10-15：拍一张 cfg 快照 = 脏标记的基线（用户 m12180：高级设置页改的值
+        #   3 秒后自己弹回）。必须紧跟在"配置已灌进界面、界面已能代表用户意图"之后，
+        #   否则会把"控件还没填值"这一瞬间当成"用户没动过"。
+        self._snapshot_cfg()
 
         # 配置方案：填充下拉列表 + 自动保存定时器（3 秒去抖，设置有变化才写盘）
         self._refresh_config_combo()
@@ -1100,6 +1115,19 @@ class MainWindow(QMainWindow):
         self.internal_params_cb.setChecked(False)
         self.internal_params_cb.stateChanged.connect(self._on_internal_params_toggled)
         outer.addWidget(self.internal_params_cb)
+
+        # ★ 2026-10-15（用户 m12180：「改了好像没生效，说不清到底存没存上」）：
+        #   这一页原先**没有任何"存没存上"的反馈**，而自动保存是每 3 秒一次、
+        #   写盘成功/跳过/失败的区别只出现在日志里。加一行状态：
+        #     ⏳ 有 N 项改动待保存（…）  →  ✅ 已自动保存（HH:MM:SS）→ 路径
+        #   纯显示，不参与任何判定（判定在 _merge_disk_owned_sections / _flush_settings）。
+        self.label_adv_save_status = QLabel("")
+        self.label_adv_save_status.setWordWrap(True)
+        self.label_adv_save_status.setStyleSheet("color: #7a7a7a; font-size: 12px;")
+        self.label_adv_save_status.setToolTip(
+            "高级设置改完不用点保存：界面每 3 秒把有变化的项自动写进当前配置文件。\n"
+            "这行只反映「这一轮改过、还没写盘」的项 —— 显示 ✅ 就说明已经写盘了。")
+        outer.addWidget(self.label_adv_save_status)
 
         self.advance_settings_gboxes = {}  # section -> QGroupBox（set_gbox_enabled 等仍遍历它）
 
@@ -2057,7 +2085,53 @@ class MainWindow(QMainWindow):
         row.addStretch()
         layout.addLayout(row)
 
-        # ── 档位说明（只读文字，不是输入框 —— 见上面"用户零配置"）─────
+        # ── 档位编辑（★ 2026-10-15 改成可编辑：用户 m12180 报
+        #    「药水键 / 什么血线喝什么药，界面上根本没法改」）─────────────────
+        #   原先这里只有一行**只读文字**，档位只能手改 config。现在每一档两个控件：
+        #     阈值（QSpinBox 0~100%）+ 按键（SingleKeyEdit，清空 = 这一档不喝）
+        #   写回 cfg["potion"]["hp"/"mp"] = [{"name","threshold","key"}, …]，
+        #   并当场热生效到引擎（set_potion_tiers），不必重开挂机。
+        #   ⚠️ 行数按**配置里现有的档位条数**建（出厂是 2 档）；配置里条数变了要重开
+        #      界面才会重建 —— 够用，不为它加"动态增删行"的复杂度。
+        self._potion_tier_editors = {}
+        _tiers_box = QWidget()
+        _tiers_layout = QFormLayout(_tiers_box)
+        _tiers_layout.setContentsMargins(0, 0, 0, 0)
+        for _label, _title in (("hp", "❤️ 血量"), ("mp", "💙 魔法")):
+            _editors = []
+            for _t in (self.cfg.get("potion", {}).get(_label) or []):
+                if not isinstance(_t, dict):
+                    continue
+                _name = str(_t.get("name", "?"))
+                _spin = QSpinBox()
+                _spin.setRange(0, 100)
+                _spin.setSuffix(" %")
+                _spin.setToolTip(f"{_title}：读数低于这个百分比就按右边的键")
+                try:
+                    _spin.setValue(int(float(_t.get("threshold", 0))))
+                except (TypeError, ValueError):
+                    _spin.setValue(0)
+                _key = SingleKeyEdit()
+                _key.setToolTip("这一档喝什么药；清空 = 这一档不喝")
+                _key.set_key(str(_t.get("key") or ""))
+                _row = QWidget()
+                _h = QHBoxLayout(_row)
+                _h.setContentsMargins(0, 0, 0, 0)
+                _h.addWidget(QLabel("低于"))
+                _h.addWidget(_spin)
+                _h.addWidget(QLabel("按"))
+                _h.addWidget(_key)
+                _h.addWidget(QLabel(f"（{_name}）"))
+                _h.addStretch()
+                _tiers_layout.addRow(QLabel(f"<b>{_title}</b>"), _row)
+                # 先填值、后接线：否则建面板时的 setValue/set_key 会被当成"用户改了"
+                _spin.valueChanged.connect(self._on_potion_tier_edited)
+                _key.keySequenceChanged.connect(self._on_potion_tier_edited)
+                _editors.append((_name, _spin, _key))
+            self._potion_tier_editors[_label] = _editors
+        layout.addWidget(_tiers_box)
+
+        # ── 档位速览（把这套档位读成一句人话；改上面的控件会同步刷新）─────
         self.label_potion_tiers = QLabel("")
         self.label_potion_tiers.setWordWrap(True)
         layout.addWidget(self.label_potion_tiers)
@@ -2134,12 +2208,120 @@ class MainWindow(QMainWindow):
         self.label_potion_env.setText(env)
 
     def on_potion_toggled(self, checked):
-        '''总开关：立刻作用到正在跑的引擎（不必停挂机）。'''
+        '''总开关：① 写进 cfg（这样它会被自动保存、重启还在）② 立刻作用到引擎。
+
+        ★ 2026-10-15 修（用户 m12180：勾上不保存，重启又变回去）：
+          这里原来**只**调 `controller.auto_bot.set_potion_enabled()`，
+          一处都没写 `self.cfg` ⇒ 总开关永远进不了配置文件，
+          而每次启动又从 `cfg["potion"]["enabled"]`（默认 true / 磁盘上的 false）
+          把控件初始化一遍 ⇒ 症状"勾了没用、重启弹回"。
+        '''
+        try:
+            self.cfg.setdefault("potion", {})["enabled"] = bool(checked)
+        except Exception as e:                                   # noqa: BLE001
+            logger.error(f"[自动喝药] 开关没能写进配置（这一次不会被保存）：{e}")
+        # 高级设置页里同名的行要跟着走（同一件事只留前面板这一个控件，
+        # 见 ADV_FIELD_HIDE['potion']）—— 用 blockSignals 防"回环把用户的选择改掉"。
+        _gbox = getattr(self, "advance_settings_gboxes", {}).get("potion")
+        _refs = getattr(_gbox, "_field_refs", None)
+        _cb = _refs.get("enabled") if isinstance(_refs, dict) else None
+        if _cb is not None:
+            try:
+                _cb.blockSignals(True)
+                _cb.setChecked(bool(checked))
+            except Exception:                                    # noqa: BLE001
+                pass
+            finally:
+                try:
+                    _cb.blockSignals(False)
+                except Exception:                                # noqa: BLE001
+                    pass
+        # 立刻落盘（不等 3 秒定时器）：用户勾完就能在文件里看到，
+        # 也让"勾上 → 关窗"这条最容易被质疑的路径一定有结果。
+        try:
+            self._flush_settings()
+        except Exception as e:                                   # noqa: BLE001
+            logger.error(f"[自动喝药] 开关写盘失败：{e}")
         try:
             self.controller.auto_bot.set_potion_enabled(checked)
         except Exception as e:                                   # noqa: BLE001
             # 引擎还没起来（没点过开始）时这里会失败 —— 属正常，不当错误
             logger.debug(f"[自动喝药] 开关暂时没送到引擎（多半还没开始挂机）：{e}")
+
+    def _on_potion_tier_edited(self, *_args):
+        '''面板上的档位被改动（阈值或按键）→ 写回 cfg + 热生效 + 刷新速览。'''
+        self._write_potion_tiers_from_ui()
+
+    def _write_potion_tiers_from_ui(self):
+        '''把面板上编辑的档位写回 cfg，并尽力热生效到正在跑的引擎。
+
+        - 写回的形状与 config 一致：`[{"name","threshold","key"}]`（key 为空 ⇒ None，
+          与出厂配置里 `key: null`"这一档不喝"同义）。
+        - 热生效失败**不算错误**：没点开始挂机时引擎里的 PotionDrinker 还没装配，
+          这次改动会留在 cfg 里、下次启动自然带上。
+        '''
+        try:
+            potion = self.cfg.setdefault("potion", {})
+            for label in ("hp", "mp"):
+                editors = getattr(self, "_potion_tier_editors", {}).get(label) or []
+                if not editors:
+                    continue
+                tiers = []
+                for name, spin, keyedit in editors:
+                    key = (keyedit.get_key() or "").strip()
+                    tiers.append({"name": name,
+                                  "threshold": int(spin.value()),
+                                  "key": key or None})
+                potion[label] = tiers
+        except Exception as e:                                   # noqa: BLE001
+            logger.error(f"[自动喝药] 档位没能写进配置：{e}")
+            return
+        try:
+            self._refresh_potion_labels()
+        except Exception:                                        # noqa: BLE001
+            pass
+        bot = getattr(getattr(self, "controller", None), "auto_bot", None)
+        setter = getattr(bot, "set_potion_tiers", None)
+        if callable(setter):
+            try:
+                setter(potion.get("hp"), potion.get("mp"))
+            except Exception as e:                               # noqa: BLE001
+                logger.debug(f"[自动喝药] 档位暂时没送到引擎（多半还没开始挂机）：{e}")
+
+    def _refresh_potion_editors_from_cfg(self):
+        '''从 cfg 把档位回填到编辑控件（切换方案 / 读配置文件之后调用）。
+
+        ⚠️ 全程 blockSignals：这是"把配置显示出来"，不是"用户改了值" ——
+           不屏蔽就会在回填时触发 _write_potion_tiers_from_ui，
+           把 cfg 写成控件里的旧值（自我覆盖）。
+        '''
+        for label in ("hp", "mp"):
+            editors = getattr(self, "_potion_tier_editors", {}).get(label) or []
+            tiers = (self.cfg.get("potion", {}) or {}).get(label) or []
+            for (name, spin, keyedit), t in zip(editors, tiers):
+                if not isinstance(t, dict):
+                    continue
+                for _w in (spin, keyedit):
+                    try:
+                        _w.blockSignals(True)
+                    except Exception:                            # noqa: BLE001
+                        pass
+                try:
+                    try:
+                        spin.setValue(int(float(t.get("threshold", spin.value()))))
+                    except (TypeError, ValueError):
+                        pass
+                    keyedit.set_key(str(t.get("key") or ""))
+                finally:
+                    for _w in (spin, keyedit):
+                        try:
+                            _w.blockSignals(False)
+                        except Exception:                        # noqa: BLE001
+                            pass
+        try:
+            self._refresh_potion_labels()
+        except Exception:                                        # noqa: BLE001
+            pass
 
     def test_bars_reading(self):
         '''🔍 试一下：抓当前画面读一次血蓝，把结果用人话告诉用户。
@@ -2495,6 +2677,9 @@ class MainWindow(QMainWindow):
 
         # Re-apply config to UI
         self.apply_config_to_ui()
+        # ★ 2026-10-15：换了方案 ⇒ 重拍快照（否则新方案里与旧快照不同的键
+        #   会被当成"用户刚改的"，一直挂在"待保存"里）
+        self._snapshot_cfg()
 
     def _merge_disk_owned_sections(self):
         '''
@@ -2521,7 +2706,28 @@ class MainWindow(QMainWindow):
         if not disk:
             return
         for section, values in disk.items():
-            if section not in managed:
+            if section in managed:
+                continue
+            # ★ 2026-10-15（用户 m12180：高级设置页改的值 3 秒后自己弹回）：
+            #   非托管段**逐键**判断 —— 只把「这一轮用户没动过」的键按磁盘合并回来，
+            #   用户刚改过的键以界面为准。
+            #
+            #   为什么不干脆把 route/potion/nametag 塞进 _MANAGED_SECTIONS：
+            #   那些段里还有**工具直接写盘**的键（F2 标定写 nametag、示范录制/路线录制
+            #   写各自的段）。整段以界面为准就会把刚标定/刚录制的结果覆盖掉 ——
+            #   2026-09-12 换号时已经踩过一次（见上面 2534 起的注释）。
+            #   逐键的判据是"快照"：快照之后变了的键 = 界面/用户改的（详见 _snapshot_cfg）。
+            base = self.cfg.get(section)
+            if not (isinstance(base, dict) and isinstance(values, dict)):
+                # 段不存在或不是字典：保持原行为（磁盘优先）；但用户刚动过这一段，
+                # 同样以界面为准，否则整段被磁盘顶掉（症状与逐键版一致）。
+                if self._cfg_section_dirty(section):
+                    continue
+                self.cfg[section] = values
+                continue
+            disk_only = {k: v for k, v in values.items()
+                         if not self._cfg_key_dirty(section, k)}
+            if disk_only:
                 # ⚠️ 必须**深合并**，绝不能整段替换（2026-09-12 实测踩坑，代价一整天）。
                 #    用户配置是「局部配置」——只写自己改过的键。整段替换会把
                 #    config_default 提供的默认键一起丢掉。本次实例：用户方案的
@@ -2529,11 +2735,85 @@ class MainWindow(QMainWindow):
                 #    global_diff_thres 全丢 → 引擎第一帧 KeyError('mode') →
                 #    主循环线程静默死亡 → 症状「点开始、角色不动、日志全静默」。
                 #    深合并的语义正好是想要的：磁盘值优先，磁盘没写的键保留默认。
-                base = self.cfg.get(section)
-                if isinstance(base, dict) and isinstance(values, dict):
-                    override_cfg(base, values)
-                else:
-                    self.cfg[section] = values
+                override_cfg(base, disk_only)
+
+    # ---- 键级「脏标记」：为什么不能整段以界面为准 / 也不能整段以磁盘为准 ----
+    # 这一段是 2026-10-15 为解决用户 m12180 报的「高级设置页改完 3 秒自己弹回」
+    # 而加的。三条口径：
+    #   ① 判据只有一处：`_snapshot_cfg()` 拍的 cfg 快照。改了值再保存成功 = 基线跟着走。
+    #   ② 快照为空（未初始化/深拷贝失败）⇒ 所有键都算"没动过"⇒ 退回老行为（磁盘优先），
+    #      所以异常路径只会退化成旧症状，不会更坏。
+    #   ③ 快照比较的是"值"，不是"控件有没有回调"—— 这样 F2 标定、示范录制这类
+    #      **绕过界面直接写 cfg/磁盘** 的路径不会被误判成"用户改的"。
+    def _snapshot_cfg(self):
+        '''给当前 cfg 拍一张快照 —— 键级脏标记的基线（改动前/保存成功后调用）。
+
+        调用点（缺一处就会退化成旧症状，所以逐个写明）：
+          · __init__ 里 `apply_config_to_ui()` 之后（配置已进控件）
+          · `load_config()` 成功读盘之后（换了方案）
+          · `_flush_settings()` 成功写盘之后（这一轮的改动已经存下了）
+          · F2/F4 量完窗口大小重读配置之后
+        '''
+        try:
+            self._cfg_snapshot = copy.deepcopy(self.cfg)
+        except Exception as e:                                       # noqa: BLE001
+            self._cfg_snapshot = {}
+            logger.error(f"[界面] 配置快照失败（保存合并会退化成按段以磁盘为准）：{e}")
+
+    def _cfg_key_dirty(self, section, key):
+        '''这一轮用户动过 cfg[section][key] 吗？（动过 ⇒ 保存时不许被磁盘旧值盖回）'''
+        snap = getattr(self, "_cfg_snapshot", None)
+        if not isinstance(snap, dict):
+            return False
+        sec = snap.get(section)
+        cur = self.cfg.get(section) if isinstance(self.cfg, dict) else None
+        if not (isinstance(sec, dict) and isinstance(cur, dict)):
+            return False
+        return cur.get(key) != sec.get(key)
+
+    def _cfg_section_dirty(self, section):
+        '''这一轮用户动过整段吗？（段不存在于快照 / 段内容不同）'''
+        snap = getattr(self, "_cfg_snapshot", None)
+        if not isinstance(snap, dict):
+            return False
+        return snap.get(section) != (self.cfg.get(section) if isinstance(self.cfg, dict) else None)
+
+    def _cfg_dirty_keys(self):
+        '''列出"这一轮改过、还没确认落盘"的 `段.键`（只用于界面提示，不做判定）。'''
+        out = []
+        snap = getattr(self, "_cfg_snapshot", None)
+        if not isinstance(snap, dict) or not isinstance(self.cfg, dict):
+            return out
+        for section, cur in self.cfg.items():
+            if not isinstance(cur, dict):
+                continue
+            sec = snap.get(section)
+            if not isinstance(sec, dict):
+                out.append(f"{section}.*")
+                continue
+            for key, val in cur.items():
+                if isinstance(val, dict):
+                    continue
+                if sec.get(key) != val:
+                    out.append(f"{section}.{key}")
+        return out
+
+    def _update_adv_save_status(self):
+        '''高级设置页顶上那行"存没存上"（用户 m12180：说不清到底存没存上）。'''
+        lbl = getattr(self, "label_adv_save_status", None)
+        if lbl is None:
+            return
+        try:
+            pending = self._cfg_dirty_keys()
+            if pending:
+                _show = "、".join(pending[:4]) + ("…" if len(pending) > 4 else "")
+                lbl.setText(f"⏳ 有 {len(pending)} 项改动待保存（{_show}），3 秒内自动写盘")
+            elif self._last_saved_at:
+                lbl.setText(f"✅ 已自动保存（{self._last_saved_at}）→ {self.path_cfg_custom}")
+            else:
+                lbl.setText(f"✅ 与磁盘一致（{self.path_cfg_custom}）")
+        except Exception as e:                                       # noqa: BLE001
+            logger.debug(f"[界面] 保存状态行刷新失败：{e}")
 
     # ---- 配置方案下拉框（2026-09-12 用户设计：新建/切换/自动保存三合一）----
     # 主界面管理的段（保存时以界面为准，防止工具写盘的结果被覆盖的合并逻辑见
@@ -2594,11 +2874,21 @@ class MainWindow(QMainWindow):
                 with open(self.path_cfg_custom, "r", encoding="utf-8") as f:
                     existing = _yaml.safe_load(f)
                 if existing == cfg_diff:
+                    # ★ 2026-10-15：磁盘已经等于内存 —— 这也是"已保存"的一种，
+                    #   要把状态行从「⏳ 待保存」翻回「✅」，否则刚改完又改回去
+                    #   时那行会一直挂着"待保存"（与真实磁盘状态不符）。
+                    self._snapshot_cfg()
+                    self._update_adv_save_status()
                     return  # 无变化，不写
             except Exception:
                 pass
         save_yaml(cfg_diff, self.path_cfg_custom)
-        logger.info(f"[界面] 设置已自动保存到 {self.path_cfg_custom}")
+        # ★ 2026-10-15：落盘成功 ⇒ 重新拍快照（脏标记归零）+ 刷新状态行。
+        #   顺序要紧：先写时间戳再拍快照，状态行才是「没有待存项」。
+        self._last_saved_at = time.strftime("%H:%M:%S")
+        self._snapshot_cfg()
+        logger.info(f"[界面] 设置已自动保存到 {self.path_cfg_custom}（{self._last_saved_at}）")
+        self._update_adv_save_status()
 
     def _autosave_tick(self):
         try:
@@ -2896,6 +3186,12 @@ class MainWindow(QMainWindow):
 
         # Advance settings
         self.update_advance_setting_ui_from_cfg()
+        # ★ 2026-10-15：档位编辑控件也要跟着配置走（切换方案 / 刚读完配置文件时，
+        #   面板上的阈值与按键必须换成新方案的值，否则用户看到的与生效的不是一回事）
+        self._refresh_potion_editors_from_cfg()
+        # ★ 2026-10-15：保存状态行也刷新一次 —— 启动/换方案/切回本页时，先让用户看到
+        #   当前是"已保存"还是"有改动待保存"，而不是等到下一次 3 秒节拍才出现文字。
+        self._update_adv_save_status()
 
     def set_gbox_enabled(self, enabled: bool):
         gray_style = "color: lightgray;" if not enabled else ""
@@ -3784,6 +4080,9 @@ class MainWindow(QMainWindow):
                                     load_yaml(self.path_cfg_custom))
         except Exception:                                        # noqa: BLE001
             pass   # 读不回来也不影响已经写进磁盘的配置
+        else:
+            # ★ 2026-10-15：重读过配置 ⇒ 重拍快照（否则新旧差异会被当成"用户改的"）
+            self._snapshot_cfg()
 
         # 从工具输出里挑出关键几行转述（别把整篇日志糊给用户）
         keep = [ln for ln in out.splitlines()

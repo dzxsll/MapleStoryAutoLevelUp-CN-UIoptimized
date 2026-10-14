@@ -331,6 +331,25 @@ jobs:
             #   拿的是键**下方**那段注释 ⇒ 每个键显示的是下一个键的说明；页面照渲染、
             #   不报错，只是说的是别人 —— 这是本次最隐蔽的一条）。
             'verify_ui_tabs',
+            # ★ 2026-10-15 加：**设置页改完要自动保存、不许把值改回去**（用户 m12180：
+            #   「高级设置的自动保存有问题，potion的药水设置也有问题」）。
+            #   真机病根（可复跑）：`_flush_settings()` 每 3 秒先 `update_cfg_from_main_ui()`
+            #   （**一处都不读高级设置页**）再 `_merge_disk_owned_sections()` —— 凡是不在
+            #   `_MANAGED_SECTIONS` 里的段（route / potion / nametag）都被**磁盘旧值**
+            #   深合并盖回；界面上还是新值、也不报错 ⇒ 症状正是"改了好像没生效、说不清
+            #   存没存上"。同批修掉 potion 三处：总开关 `on_potion_toggled` 只送引擎、
+            #   **从不写 cfg**（重启弹回）；档位（血线/按键）在界面上**只读、根本改不了**；
+            #   引擎启动那行 `[血蓝监控] 已启用自动喝药。` 是**无条件**打印的（关着也这么说，
+            #   与每 5 秒的「喝药已关闭」自相矛盾）。另挖出 `QKeySequence('pageup')`
+            #   解析不出（出厂档位键就是 pageup/home/end）⇒ 控件空白、一动就写成空串、
+            #   那一档从此不喝药且不报错。
+            #   判据：改过的键以界面为准、没动过的键仍按磁盘合并（保 2026-09-12 的修复）/
+            #   空快照退化成老行为 / 不把它们塞进 `_MANAGED_SECTIONS`（整段以界面为准会
+            #   盖掉 F2 标定与示范录制刚写盘的结果）/ 开关写 cfg + **立刻落盘** + 面板独占
+            #   （`ADV_FIELD_HIDE['potion']` 含 'enabled'）/ 档位编辑器往返（含 pageup）+
+            #   热生效到 `set_potion_tiers` 且保留冷却与连续帧进度 / 非法档位 fail-closed /
+            #   引擎日志按真实开关说 / 状态行 ✅⇄⏳。
+            'verify_ui_autosave',
             'verify_ci_green_check'
           )
           # ⚠️ 注意：tools/verify_nametag_fallback_limit.py **不进 CI** ——

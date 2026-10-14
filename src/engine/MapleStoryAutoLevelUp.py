@@ -69,7 +69,7 @@ from src.utils import stuck_alert
 #   potions.py       喝药决策（四层防误触）+ 带前台守卫的按键执行
 from src.utils.bars import BarsDetector
 from src.utils.bar_smoothing import BarsSmoother
-from src.utils.potions import PotionDrinker, press_potion
+from src.utils.potions import PotionDrinker, parse_tiers, press_potion
 from src.utils.env_precheck import check_bars_environment, format_for_log
 
 class MapleStoryAutoBot:
@@ -569,8 +569,16 @@ class MapleStoryAutoBot:
                             for t in self.potion_drinker.hp.tiers) or "无"
         mp_keys = ", ".join(f"{t.name}<{t.threshold:.0f}%→{t.key or '不喝'}"
                             for t in self.potion_drinker.mp.tiers) or "无"
+        # ⚠️ 2026-10-15：这一行必须**按真实开关状态**说（用户 m12180 报的"日志自相矛盾"：
+        #    这里原先无条件写「已启用自动喝药」，而每 5 秒的 `[血蓝] … （喝药已关）`
+        #    说关着 —— 两条同时出现在一份日志里，用户没法判断它到底喝不喝）。
+        #    真实状态在 self.potion_enabled（上面 :554-555 从 potion_cfg.enabled 读出，
+        #    界面 set_potion_enabled 可随时改）。
+        _switch = (
+            "已启用自动喝药" if self.potion_enabled else
+            "自动喝药是关的（potion.enabled: false）—— 界面「启用自动喝药」勾上即生效")
         logger.info(
-            f"[血蓝监控] 已启用自动喝药。\n"
+            f"[血蓝监控] {_switch}。\n"
             f"        血量：{hp_keys}（冷却 {self.potion_drinker.hp.cooldown_sec}s）\n"
             f"        魔法：{mp_keys}（冷却 {self.potion_drinker.mp.cooldown_sec}s）\n"
             f"        连续 {self.potion_drinker.hp.confirm_frames} 帧低于阈值才按键；"
@@ -631,6 +639,37 @@ class MapleStoryAutoBot:
         if self.potion_drinker is not None:
             self.potion_drinker.enabled = self.potion_enabled
         logger.info(f"[血蓝监控] 自动喝药已{'开启' if self.potion_enabled else '关闭'}。")
+
+    def set_potion_tiers(self, hp_raw, mp_raw):
+        '''界面改了药水档位后热生效（2026-10-15 加，用户 m12180）。
+
+        为什么需要：档位（什么血线喝什么药）原先只能在 config 里手改，
+        界面上只是一行只读文字 —— 用户要求"界面上能改、改完自动保存"。
+
+        取三条口径：
+        - 只在**已装配**（potion_drinker 存在）时生效：还没开始挂机时界面改的值
+          会写进 config，下次启动自然带上；这里静默返回 False，不当错误。
+        - 只换 tiers，**保留**冷却与"连续 N 帧确认"的进度（_last_drink_at/
+          _candidate_*）—— 用户只是把阈值从 30 改成 45，不该把确认进度清掉。
+        - 解析失败就**整体不改**（fail-closed：宁可继续用旧档位，也不要把喝药
+          弄成半配置 —— 半配置的后果是"该喝的档位不存在"，那是要命的）。
+        '''
+        if self.potion_drinker is None:
+            return False
+        try:
+            hp_tiers = parse_tiers(hp_raw, "hp")
+            mp_tiers = parse_tiers(mp_raw, "mp")
+        except Exception as e:                                       # noqa: BLE001
+            logger.error(f"[血蓝监控] 界面送来的档位不合法，保持原档位不变：{e}")
+            return False
+        self.potion_drinker.hp.tiers = hp_tiers
+        self.potion_drinker.mp.tiers = mp_tiers
+        _hp = ", ".join(f"{t.name}<{t.threshold:.0f}%→{t.key or '不喝'}"
+                        for t in hp_tiers) or "无"
+        _mp = ", ".join(f"{t.name}<{t.threshold:.0f}%→{t.key or '不喝'}"
+                        for t in mp_tiers) or "无"
+        logger.info(f"[血蓝监控] 档位已更新（界面改的）—— 血量：{_hp}；魔法：{_mp}")
+        return True
 
     def _route_pixels(self, img):
         '''收集路线图上的色码像素坐标（validate_route_image / 闭环检查共用）。

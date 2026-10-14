@@ -45,6 +45,62 @@ def clear_debug_canvas(canvas):
     canvas.setText("按开始或 'F1' 启动脚本")
     canvas.setAlignment(Qt.AlignCenter)
 
+# ── 按键名的双向映射：Qt 的叫法 ↔ 驱动（interception）的叫法 ──────────────
+# 为什么必须有这一层（2026-10-15，查用户 m12180「药水键改不了」时挖出来的）：
+#   `QKeySequence` 只认 Qt 的叫法，驱动键表是另一套，而且**不是一一对应**：
+#     · 'pageup' 在 Qt 里**根本解析不出来** —— QKeySequence('pageup').toString() == ''
+#     · Qt 回头会吐 'PgUp' / 'Ins' / 'Del'，而驱动要的是 'pageup' / 'insert' / 'delete'
+#   不做转换的后果（真机形态）：控件显示空白（或写出驱动不认识的键名）⇒ 用户一动
+#   这个键，写回配置的就是空串 / 无效名 ⇒ **那一档/那个功能静默失效，且不报错**。
+#   potion 的出厂档位键正是 pageup / home / end —— 第一个就中招。
+KEY_TO_QT = {
+    'pageup': 'PgUp', 'pagedown': 'PgDown',
+    'insert': 'Ins', 'delete': 'Del',
+    'esc': 'Esc', 'space': 'Space', 'enter': 'Enter', 'tab': 'Tab',
+    'ctrl': 'Control', 'control': 'Control', 'alt': 'Alt', 'shift': 'Shift',
+    'home': 'Home', 'end': 'End',
+    'left': 'Left', 'right': 'Right', 'up': 'Up', 'down': 'Down',
+}
+KEY_FROM_QT = {
+    'pgup': 'pageup', 'pageup': 'pageup',
+    'pgdn': 'pagedown', 'pgdown': 'pagedown', 'pagedown': 'pagedown',
+    'ins': 'insert', 'insert': 'insert',
+    'del': 'delete', 'delete': 'delete',
+    'escape': 'esc', 'esc': 'esc',
+    'return': 'enter', 'enter': 'enter',
+    'control': 'control', 'ctrl': 'ctrl',
+    'space': 'space', 'tab': 'tab',
+    'home': 'home', 'end': 'end',
+    'left': 'left', 'right': 'right', 'up': 'up', 'down': 'down',
+}
+
+
+def key_to_qt(key):
+    '''驱动键名 → 能喂给 QKeySequence 的显示名（空 ⇒ 空串）。'''
+    k = str(key or '').strip()
+    if not k:
+        return ''
+    low = k.lower()
+    if low in KEY_TO_QT:
+        return KEY_TO_QT[low]
+    if low.startswith('f') and low[1:].isdigit():
+        return low.upper()          # f1 → F1
+    return k.upper() if len(k) == 1 else k
+
+
+def key_from_qt(text):
+    '''QKeySequence 的显示名 → 驱动键名（空 ⇒ 空串；未知名原样小写）。'''
+    t = str(text or '').strip()
+    if not t:
+        return ''
+    low = t.lower().replace(' ', '')
+    if low in KEY_FROM_QT:
+        return KEY_FROM_QT[low]
+    if low.startswith('f') and low[1:].isdigit():
+        return low
+    return low
+
+
 class SingleKeyEdit(QKeySequenceEdit):
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
@@ -63,17 +119,21 @@ class SingleKeyEdit(QKeySequenceEdit):
             self.setKeySequence(QKeySequence(key))
 
     def set_key(self, key_str):
+        """把驱动/interception 的键名填进控件（'pageup' / 'control' / 'w' …）。
+
+        ⚠️ 必须过 KEY_TO_QT：直接 `QKeySequence('pageup')` 会得到**空序列**
+           （Qt 不认这个名字），控件上是空白，用户一动就把它写成空串。
         """
-        Set the key sequence from string like 'A', 'F1', etc.
-        """
-        self.setKeySequence(QKeySequence(key_str))
+        self.setKeySequence(QKeySequence(key_to_qt(key_str)))
 
     def get_key(self):
-        """
-        Return the currently set key as a string, like 'A', 'F1', etc.
+        """取当前键的**驱动名**（'pageup' / 'insert' / 'w' …）。
+
+        ⚠️ 必须过 KEY_FROM_QT：Qt 会用 NativeText 吐 'PgUp' / 'Ins' / 'Del'，
+           这些名字喂给驱动是 UnknownKeyError（每类只warning一次 ⇒ 静默失效）。
         """
         seq = self.keySequence()
-        return seq.toString(QKeySequence.NativeText).strip().lower()
+        return key_from_qt(seq.toString(QKeySequence.NativeText).strip())
 
 class QtLogHandler(logging.Handler, QObject):
     '''

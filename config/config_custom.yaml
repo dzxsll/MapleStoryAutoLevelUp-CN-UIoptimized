@@ -1,15 +1,35 @@
-# 用户配置覆盖（基准值见 config_default.yaml）
-#
-# 这里是「局部配置」——只写你相对默认值改过的键，其余一律沿用 config_default。
-# 加载语义是深合并：config_default 铺底，本文件覆盖同名键。
-# 只写改动项的好处：config_default 升级后，没写过的键会自动跟着更新，
-# 不会因为整段替换而丢掉新默认值（历史上踩过这个坑，见 src/ui/ui.py 的注释）。
-#
-# 主界面「配置方案」里另存的方案（config/<方案名>.yaml）与这个文件同构，
-# 区别只是它属于个人数据、不进仓库。
-
+aoe_skill:
+  range_x: 340
+  range_y: 140
+bot:
+  attack: aoe_skill
+  map: "\u5E9F\u94C12"
+buff_skill:
+  cooldown:
+  - 900
+  keys:
+  - delete
+key:
+  aoe_skill: w
+  jump: alt
+  pickup: control
+  teleport: space
 monster_detect:
-  # 怪物模板匹配阈值。0.8 是上游默认值，在国服画面上误报偏多；
-  # 实测 0.4 更合适。换模板后若发现偏宽/偏严，用
-  # tools/mob_template_qa.py 重新测一遍再改这里。
-  diff_thres: 0.4
+  approach_confirm_s: 0.4
+  detect_range_scale: 1.2
+  detect_range_scale_y: 1.0
+  every_n_frames: 1
+  mob_engage_margin: 5
+  search_box_margin: 30
+  stop_attack_clear_frames: 3
+  stop_attack_clear_s: 0.6
+nametag:
+  name: "\u4E2D\u7EA7\u5192\u9669\u5BB6\u52CB\u7AE0"
+  offset:
+  - 4
+  - 54
+route:
+  ladder_leave_x: 4
+  ladder_still_s: 1.5
+  rope_stuck_s: 0.0
+  search_range: 5
