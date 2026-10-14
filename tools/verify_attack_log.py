@@ -305,6 +305,94 @@ check_true("心跳本身不抛（桩只有最小字段）", _ok)
 
 print()
 print("=" * 72)
+print("[6] [开火预算]（2026-10-14 加，用户 m10830：把'人眼的实时反应'拆成低频确认流程）")
+print("=" * 72)
+_FB = inspect.getsource(MapleStoryAutoBot._log_fire_budget)
+_NL = inspect.getsource(MapleStoryAutoBot._budget_note_lost)
+
+# 6.1 没数据也必须说话（"没有行"不等于"没问题"）
+_s = make_stub()
+_msgs = captures(_s._log_fire_budget)
+_m = one_msg(_msgs, "[开火预算]")
+check_true("没数据也打一行（否则没观测 = 看不出问题）", bool(_m), repr(_msgs))
+check_true("没数据：覆盖率写 0%", "覆盖率 0%" in _m, _m)
+check_true("没数据：三段写 '-' 且带 n=0（没数据 ≠ 0 秒）",
+           "可见→确认 -(n=0)" in _m and "进框→出刀 -(n=0)" in _m, _m)
+check_true("没数据：没打成的账写 '-'", "没打成的账：-" in _m, _m)
+
+# 6.2 覆盖率算得对（近 60s 内"距上次出招 ≤1s"的累计时间占比）
+_s = make_stub()
+_now = time.time()
+_s._budget_atk_ts = [_now - 3.0, _now - 2.5, _now - 2.0, _now - 1.5]
+_s._budget_see2ok = [0.04]
+_s._budget_ok2box = [1.2]
+_s._budget_box2hit = [0.03, 0.05]
+_s._budget_lost = {"高差(帧)": 3, "未确认(次)": 5}
+_m = one_msg(captures(_s._log_fire_budget), "[开火预算]")
+check_true("覆盖率：3 个 0.5s 间隔 + 末尾 1.0s = 2.5s/60s ⇒ 4%",
+           "覆盖率 4%" in _m, _m)
+check_true("可见→确认 取中位（0.04s）", "可见→确认 0.04s(n=1)" in _m, _m)
+check_true("确认→进框 取中位（1.20s）", "确认→进框 1.20s(n=1)" in _m, _m)
+check_true("进框→出刀 取中位（两个样本取第 2 个 = 0.05s）",
+           "进框→出刀 0.05s(n=2)" in _m, _m)
+check_true("没打成的账：逐项带次数", "未确认(次) 5" in _m and "高差(帧) 3" in _m, _m)
+
+# 6.3 算完清零（失败路径也清），否则下一次会重复报同一批数字
+_s = make_stub()
+_s._budget_atk_ts = [time.time()]
+_s._budget_see2ok = [0.04]
+_s._budget_lost = {"未确认(次)": 1}
+captures(_s._log_fire_budget)
+check("清零：三段样本表清空", (_s._budget_see2ok, _s._budget_ok2box, _s._budget_box2hit),
+      ([], [], []))
+check("清零：没打成的账清空", _s._budget_lost, {})
+_m2 = one_msg(captures(_s._log_fire_budget), "[开火预算]")
+check_true("第二次调用：账目已是空的", "没打成的账：-" in _m2, _m2)
+
+# 6.4 跟 detect_log 同一个开关
+_s = make_stub()
+_s.cfg["monster_detect"] = {"detect_log": False}
+check("detect_log=False：一行都不打", captures(_s._log_fire_budget), [])
+
+# 6.5 垃圾数据：不炸、但只吼一次（不许每 5 秒刷屏，也不许静默）
+_s = make_stub()
+_s._budget_atk_ts = ["这不是数字"]
+_msgs = captures(_s._log_fire_budget)
+check_true("垃圾数据：打一行「统计失败」（失败不静默）",
+           any("统计失败" in _x for _x in _msgs), repr(_msgs))
+_msgs2 = captures(_s._log_fire_budget)
+check_true("垃圾数据：第二次不再重复（只吼一次）",
+           not any("统计失败" in _x for _x in _msgs2), repr(_msgs2))
+
+# 6.6 接线与纯观测
+check("源码里 `_log_fire_budget` 定义 1 次", _SRC.count("def _log_fire_budget(self):"), 1)
+check("源码里 `_budget_note_lost` 定义 1 次", _SRC.count("def _budget_note_lost(self, why):"), 1)
+check("心跳里调用 `_log_fire_budget()` 1 次", _SRC.count("self._log_fire_budget()"), 1)
+check_true("调用点与 [出招] 心跳同级缩进（同一个 5 秒 if 里）",
+           "\n            self._log_fire_budget()" in _SRC)
+check_true("调用点紧跟 `_log_attack_heartbeat()` 之后",
+           _SRC.index("self._log_attack_heartbeat()")
+           < _SRC.index("self._log_fire_budget()"))
+check_true("调用点在 [运行状态] 同一个 5 秒节拍里（距离够近）",
+           _SRC.index("self._log_fire_budget()") - _SRC.index("[运行状态] 帧") < 900,
+           f"gap={_SRC.index('self._log_fire_budget()') - _SRC.index('[运行状态] 帧')}")
+for _why in ("被让路(帧)", "爬绳放弃(次)", "未确认(次)", "高差(帧)"):
+    check_true(f"记账点齐全：{_why}", f'_budget_note_lost("{_why}")' in _SRC)
+check_true("_log_fire_budget 不写指令（纯观测）", "self.cmd_" not in _FB)
+check_true("_log_fire_budget 有 getattr 兜底（桩不走 __init__ 也不炸）",
+           "_budget_atk_ts\", None)" in _FB or "getattr(self, \"_budget_atk_ts\"" in _FB)
+check_true("_log_fire_budget 被 try/except 包住", "except Exception" in _FB)
+check_true("finally 里清账（失败路径也清）", "finally:" in _FB
+           and "_budget_lost = {}" in _FB.split("finally:")[-1])
+check_true("_budget_note_lost 自己建 dict（不在 __init__ 也能用）",
+           "isinstance(_d, dict)" in _NL)
+for _f in ("self._budget_atk_ts = []", "self._budget_see2ok = []",
+           "self._budget_ok2box = []", "self._budget_box2hit = []",
+           "self._budget_lost = {}", "self._budget_warned = False"):
+    check_true(f"__init__ 初始化 {_f}", _f in _SRC)
+
+print()
+print("=" * 72)
 print(f"结果：通过 {PASS} / 失败 {FAIL}")
 print("=" * 72)
 sys.exit(1 if FAIL else 0)

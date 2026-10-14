@@ -120,6 +120,17 @@ class MapleStoryAutoBot:
         # 这里只存日志节流戳与一个纯观测计数（判据全在 `_rope_nudge_dir()`）。
         self.t_rope_nudge_log = 0.0   # 「绳梯自救」那行日志的 1.5s 节流戳
         self._rope_nudge_n = 0        # 本次开跑累计蹭过的帧数（纯观测）
+        # ── 爬梯"走完"（2026-10-15 加，用户 m11669）──────────────────────────
+        # 见 config/config_default.yaml 的 route.ladder_finish* 长注释与
+        # `_ladder_finish_tick()`。为什么要有：梯子上按左右**不动**（人还挂在绳上），
+        #   而路线有时这帧只给横向像素 ⇒ 键一直在发、人不动，怪逻辑趁机站桩打怪。
+        #   真机取证（log/MSBot_2026-10-15_00-36-31.log，26 分钟）：
+        #   全局(210,60) 停 30s（竖向指令 0/6 帧、5/6 帧有怪）、(78,74) 停 15s、
+        #   (180,64) 停 15s —— 同一段里 `旗标粘着：6550ms ⇒ 不再让路` 反复出现。
+        self._last_vert_cmd = "up"     # 路线最近一次给的竖向指令（补的时候用）
+        self._ladder_push_t0 = 0.0     # 本轮"补竖向"的起表时刻（0 = 没在补）
+        self._ladder_push_cool = 0.0   # 补超时仍无进展 ⇒ 冷却到这个时刻
+        self.t_ladder_finish_log = 0.0 # 「[爬梯] …」那行日志的节流戳
         self.is_show_debug_window = not args.disable_viz #
         self.is_need_show_debug_window = not args.disable_viz #
         self.is_disable_control = args.disable_control
@@ -182,6 +193,21 @@ class MapleStoryAutoBot:
         self._atk_gap_max = 0.0
         self._atk_eng_min = None      # 出招时攻击框内的怪数（区间）
         self._atk_eng_max = 0
+        # [开火预算]（2026-10-14 加，纯观测，P4；用户 m10830「把'人眼的实时反应'
+        #   拆解成'适合低频检测的确认流程'」）：把"从看见一只怪到真正出刀"拆成
+        #   四段计时 + 丢失原因计数，每 5 秒随 [运行状态] 打一行 `[开火预算]`。
+        #   为什么需要它：`[出招·延迟]` 只量最后一段（进框→出刀，真机 p50 33ms），
+        #   而审计（log/MSBot_2026-10-14_17-40-51.log 段11）显示时间花在
+        #   "该不该打/走不走得过去"上 ⇒ 没有分段计时就只能猜是哪一段慢。
+        #   一律 getattr 兜底（离线自检的 Stub 不走 __init__）。
+        self._budget_atk_ts = []      # 最近 60s 的出招时刻（算覆盖率）
+        self._budget_vis_t0 = None    # 本段"看见框外可追目标"的起始时刻
+        self._budget_confirm_t = None # 上一次"确认可追"的时刻（量 确认→进框）
+        self._budget_see2ok = []      # 可见→确认（秒）
+        self._budget_ok2box = []      # 确认→进框（秒）
+        self._budget_box2hit = []     # 进框→出刀（秒）
+        self._budget_lost = {}        # 丢失原因计数（高差/未确认/让路/爬绳放弃）
+        self._budget_warned = False   # 统计失败只吼一次
         self.loc_player_minimap = (0, 0) # player location on minimap
         self.loc_minimap_global = (0, 0) # minimap location on global map
         self.loc_player_global = (0, 0) # player location on global map
@@ -2735,6 +2761,12 @@ class MapleStoryAutoBot:
             _now = time.time()
             _prev = float(getattr(self, "t_last_attack", 0.0) or 0.0)
             self._atk_n = int(getattr(self, "_atk_n", 0)) + 1
+            # ★ P4 纯观测：把出招时刻留给 [开火预算] 算"近 60s 覆盖率"
+            try:
+                self._budget_atk_ts = list(
+                    getattr(self, "_budget_atk_ts", None) or [])[-600:] + [_now]
+            except Exception:                                 # noqa: BLE001
+                pass
             if _prev > 0:
                 _gap = _now - _prev
                 # 只收合理间隔：跨"停下打怪/回正/爬梯"的巨大间隔会把平均值带偏
@@ -2770,6 +2802,17 @@ class MapleStoryAutoBot:
                         f"[出招·延迟] 第一只怪进攻击框 → 出刀 用了 {_ms:.0f}ms"
                         f"（检测每 {monster_detect_interval(self.cfg)} 帧一次；"
                         f"设定冷却 {_cd:.2f}s）")
+                    # ★ P4 纯观测（2026-10-14）：进框→出刀 + 确认→进框 两段的样本
+                    try:
+                        self._budget_box2hit = list(
+                            getattr(self, "_budget_box2hit", None) or []) + [_ms / 1000.0]
+                        _ct = getattr(self, "_budget_confirm_t", None)
+                        if _ct:
+                            self._budget_ok2box = list(
+                                getattr(self, "_budget_ok2box", None) or []) + [_now - float(_ct)]
+                            self._budget_confirm_t = None
+                    except Exception:                             # noqa: BLE001
+                        pass
         except Exception:                                     # noqa: BLE001
             pass
 
@@ -2821,6 +2864,81 @@ class MapleStoryAutoBot:
             self._atk_gap_max = 0.0
             self._atk_eng_min = None
             self._atk_eng_max = 0
+
+    def _budget_note_lost(self, why):
+        '''[开火预算] 记一次"没打成"的原因（纯观测；失败绝不影响判定/挂机）。'''
+        try:
+            _d = getattr(self, "_budget_lost", None)
+            if not isinstance(_d, dict):
+                _d = {}
+                self._budget_lost = _d
+            _d[str(why)] = int(_d.get(str(why), 0)) + 1
+        except Exception:                                     # noqa: BLE001
+            pass
+
+    def _log_fire_budget(self):
+        '''
+        纯观测：`[开火预算] …`（2026-10-14 加，P4；紧跟 [出招] 的 5 秒节拍）。
+
+        由来（用户 m10830「把'人眼的实时反应'拆解成'适合低频检测的确认流程'」）：
+          审计 `log/MSBot_2026-10-14_17-40-51.log` 段11（152 分钟）显示「出招」本身
+          不慢（`[出招·延迟]` p50 33ms＝怪已在框里到出刀约一帧），慢的是"该不该打、
+          走不走得过去"：>10s 的打怪空档 105 次合计 2726s（占 30%），其中 104 次
+          含 `[绳/梯]` 事件、87 次（1540s = 17%）角色几乎没动却在按着键。
+          ⇒ 把"从看见一只怪到真正出刀"拆成三段计时 + 没打成的账，才能在下一次
+          真机会话里直接读出**是哪一段**慢，而不是靠猜。
+
+        三段的定义（都能在 `[出招·延迟]` / `[没出招·归因]` 里对上）：
+          · 可见→确认：第一次看见"框外够得着的怪" → 凑够 2 次证据（P1 出现确认）；
+          · 确认→进框：确认可追 → 第一只怪进攻击框（走位/追怪这一段）；
+          · 进框→出刀：第一只怪进攻击框 → 真的发刀（与 `[出招·延迟]` 同源）。
+        覆盖率的定义（与审计脚本 `_c5.py` 一致）：最近 60s 里"距上一次出招 ≤1s"
+          的时间占比 —— 它把"站桩/爬绳/走位"与"在打"直接分开。
+
+        跟 `monster_detect.detect_log` 同一个开关（关掉明细日志就一起关掉）。
+        ⚠️ 纯观测：全部 getattr 兜底、异常只吼一次，绝不影响判定/挂机。
+        '''
+        try:
+            if not bool((self.cfg.get("monster_detect") or {}).get("detect_log", True)):
+                return
+            _now = time.time()
+            # ① 覆盖率（近 60s）
+            _ts = [float(_t) for _t in (getattr(self, "_budget_atk_ts", None) or [])
+                   if _now - float(_t) <= 60.0][-600:]
+            self._budget_atk_ts = _ts
+            _cov = 0.0
+            for _i in range(1, len(_ts)):
+                _g = _ts[_i] - _ts[_i - 1]
+                if _g <= 1.0:
+                    _cov += _g
+            if _ts:
+                _cov += min(_now - _ts[-1], 1.0)
+            _cov_pct = 100.0 * _cov / 60.0
+            _a = list(getattr(self, "_budget_see2ok", None) or [])
+            _b = list(getattr(self, "_budget_ok2box", None) or [])
+            _c = list(getattr(self, "_budget_box2hit", None) or [])
+            _segs = []
+            for _xs, _lab in ((_a, "可见→确认"), (_b, "确认→进框"), (_c, "进框→出刀")):
+                _v = sorted(float(_x) for _x in _xs)
+                _p = _v[len(_v) // 2] if _v else None
+                _segs.append(f"{_lab} " + ("-" if _p is None else f"{_p:.2f}s")
+                             + f"(n={len(_v)})")
+            _lost = getattr(self, "_budget_lost", None) or {}
+            _lost_txt = " / ".join(f"{_k} {int(_v)}"
+                                   for _k, _v in sorted(_lost.items())) or "-"
+            logger.info(
+                f"[开火预算] 近60s 覆盖率 {_cov_pct:.0f}%" + "；"
+                + "；".join(_segs) + f"；没打成的账：{_lost_txt}")
+        except Exception as _e:                               # noqa: BLE001
+            if not getattr(self, "_budget_warned", False):
+                self._budget_warned = True
+                logger.info(f"[开火预算] 统计失败：{_e!r}")
+        finally:
+            # 与 [出招] 心跳同一个约定：失败了也要清账，否则永远重复同一批数字
+            self._budget_see2ok = []
+            self._budget_ok2box = []
+            self._budget_box2hit = []
+            self._budget_lost = {}
 
     def _log_monster_detect(self, engage, far):
         '''
@@ -2932,8 +3050,10 @@ class MapleStoryAutoBot:
         2026-10-14（低频识别优化 P1，用户 m05009「落地」）加，治真机日志
         （MSBot_2026-10-14_10-03-15.log 的 11:02 段）里看得见的两件事：
           ① **幻影目标**：单帧匹配偶尔会在别处认出一个假目标，老口径"看见一帧就追"
-             会让角色为一个不存在的目标横着走几百像素。现在要求"连续两次采样都
-             看见够得着的远处怪"（两次间隔 ≤ `approach_confirm_s`）才算真看见。
+             会让角色为一个不存在的目标横着走几百像素。现在要求"看见够得着的远处怪"
+             至少 **2 次采样**才算真看见；★ 2026-10-14（用户 m10830）把"两次紧挨着"
+             放宽成"`approach_confirm_s` 秒**窗口内累计**两次"（见 ① 处的长注释：
+             老口径在闪烁时会永远凑不齐）。
           ② **左右抖动**：日志里 `[靠近] …left 侧 323px` / `right 侧 282px` 每隔
              几秒换一次边 —— 两只怪离得差不多远时，"最近的那只"每帧都可能换人，
              角色就来回抽方向。现在方向至少保持 `approach_dir_min_s` 秒；
@@ -2974,6 +3094,7 @@ class MapleStoryAutoBot:
         _now = float(now) if now is not None else time.time()
         _px, _py = self.loc_player[0], self.loc_player[1]
         _cands = []
+        _n_dy_skip = 0
         for _m in far_mobs or []:
             try:
                 _mx, _my = _m["position"]
@@ -2982,23 +3103,51 @@ class MapleStoryAutoBot:
                 continue
             _cx, _cy = _mx + _mw // 2, _my + _mh // 2
             if abs(_cy - _py) > _dy_tol:
+                _n_dy_skip += 1
                 continue                       # 跨层：交给路线，不横着硬走
             _cands.append((_cx, _cy, abs(_cx - _px) + abs(_cy - _py)))
+        if _n_dy_skip and not _cands:
+            # ★ P4 纯观测：这一帧"看见了但够不着"的账记在跨层上（不是没看见）
+            self._budget_note_lost("高差(帧)")
         if not _cands:
             return None, None, None
-        # ── ① 出现确认：连续两次**采样**都看见远处有够得着的怪才算数 ──────────
+        # ── ① 出现确认：**证据累积（N-of-M）** —— `approach_confirm_s` 秒窗口内
+        #    **累计**看见 ≥2 次采样才算数（不再要求"两次紧挨着"）──────────────
+        #    ⚠️ 2026-10-14（用户 m10830「把'人眼的实时反应'拆解成'适合低频检测的
+        #       确认流程'」）把老口径"连续两次**紧邻**采样"升级成"窗口内两次"：
+        #       老口径在**闪烁**（看见 / 丢一帧 / 又看见）时会永远凑不齐 —— 真机
+        #       `MSBot_2026-10-14_17-40-51.log` 段11 里 `[没出招·归因]` 有 113 条
+        #       （15%）就是"框外有目标但确认没凑齐"，其中绝大多数是"每一次新出现
+        #       的首帧都算 pending"和"丢一帧就把计数清零"。人眼不会因为眨了一下眼
+        #       就把刚看见的怪从记忆里删掉 —— 但也不能只凭一帧就为幻影目标横着走
+        #       （那正是老口径要治的病），所以保留"至少两次证据"这条底线。
         #    ⚠️ `approach_confirm_s: 0`（或负）= **关掉**这道防抖，逐字退回老口径
         #       「看见一帧就追」—— 与 `target_hold_s: 0` 的约定一致（0 = 关）。
-        #       所以 ① 整段必须包在 `if _confirm_s > 0` 里，不能只靠"两次间隔 ≤ 0"
-        #       去凑：第一帧的计数天生是 1，那样"关掉"也会少追一帧。
+        #       所以 ① 整段必须包在 `if _confirm_s > 0` 里，不能只靠"窗口为 0"
+        #       去凑：第一帧的证据天生只有 1 条，那样"关掉"也会少追一帧。
         if _confirm_s > 0.0:
             if _now - float(getattr(self, "_approach_count_t", 0.0) or 0.0) > 0.001:
                 self._approach_count_t = _now
-                if _now - float(getattr(self, "_approach_seen_t", 0.0) or 0.0) <= _confirm_s:
-                    self._approach_n = int(getattr(self, "_approach_n", 0)) + 1
-                else:
-                    self._approach_n = 1
+                _prev_n = int(getattr(self, "_approach_n", 0))
+                _ts = [float(_t) for _t in (getattr(self, "_approach_seen_ts", None) or [])
+                       if _now - float(_t) <= _confirm_s]
+                _ts.append(_now)
+                self._approach_seen_ts = _ts
+                self._approach_n = len(_ts)          # 只读用途：日志/自检能看出凑了几条
                 self._approach_seen_t = _now
+                # ★ P4 纯观测（2026-10-14，用户 m10830）：量"看见 → 确认"这一段。
+                try:
+                    if _prev_n == 0:
+                        self._budget_vis_t0 = _now        # 新的一段"看见可追目标"
+                    if _prev_n < 2 <= len(_ts):
+                        _v0 = getattr(self, "_budget_vis_t0", None)
+                        if _v0:
+                            self._budget_see2ok = list(
+                                getattr(self, "_budget_see2ok", None) or []) + [_now - float(_v0)]
+                        self._budget_vis_t0 = None
+                        self._budget_confirm_t = _now     # 下一段"确认 → 进框"的起点
+                except Exception:                             # noqa: BLE001
+                    pass
             if int(getattr(self, "_approach_n", 0)) < 2:
                 return None, None, None        # 只认到一帧 —— 可能是幻影，等下次采样
         _cx, _cy, _dist = min(_cands, key=lambda _c: _c[2])
@@ -6024,6 +6173,31 @@ class MapleStoryAutoBot:
         elif color_code_up_down:
             self.cmd_move_x, self.cmd_move_y, self.cmd_action = color_code_up_down["command"].split()
 
+        # ── 记下"路线最近一次给的竖向指令"（爬梯补竖向时要用，见
+        #    `_ladder_finish_tick()`）—— 只读一支，不改任何行为 ────────────────
+        if str(self.cmd_move_y) in ("up", "down"):
+            self._last_vert_cmd = str(self.cmd_move_y)
+
+        # ── P0（2026-10-14，用户 m10830）：爬绳超时 ⇒ 本帧不再按 up/down ──────
+        # 判据与状态机全在 `_rope_ladder_giveup_tick()`（那边唯一写状态），
+        # 这里只做一件事：把竖向压成 none。**只压竖向** —— 横向/动作仍由路线与
+        # 怪逻辑照旧决定（不许顺手把整条指令清掉，那会让角色在绳脚定住不动）。
+        # 目的：那一秒不再死按方向键顶着绳（真机最长 211s、发键 90~96 次/5s）。
+        if (str(self.cmd_move_y) in ("up", "down")
+                and not self.is_on_ladder
+                and self._rope_giveup_now()):
+            self.cmd_move_y = "none"
+
+        # ── 爬梯"走完"（2026-10-15 加，用户 m11669）──────────────────────────
+        # 判据与状态机全在 `_ladder_finish_tick()`（那边唯一改状态），这里只做一件事：
+        # **把竖向补上**。为什么：梯子上按左右是不动的（人还挂在绳上），而路线这帧
+        # 可能只给横向像素 ⇒ 键一直在发、人不动（真机 26 分钟里 (210,60) 停 30s）。
+        # 补上之后 `_ladder_yield()` 的"路线给 up/down ⇒ 始终让路"自然生效 ⇒
+        # 怪逻辑全程静音（用户原话"不要检测怪了"）。
+        _ladder_push = self._ladder_finish_tick()
+        if _ladder_push:
+            self.cmd_move_y = _ladder_push
+
         # ── 窄平台降级：把路线给的**左右移动**吞掉（见 _patrol_degraded_now）──
         # 只吞 cmd_move_x，保留 cmd_move_y / cmd_action —— 改动面最小。
         # ⚠️ 放在这里是安全的：update_cmd_by_mob_detection 在后面跑，它还会按
@@ -6147,6 +6321,96 @@ class MapleStoryAutoBot:
             return 0.0                # 拿不到全局坐标 ⇒ 测不到竖向进展
         return _v
 
+    def _rope_stuck_s(self):
+        '''
+        「爬了这么久还没上去，就不再死等」的窗口（秒，`route.rope_stuck_s`）——
+        **只有这一处读**。
+
+        返回 0.0 表示**本层关掉**（用户明确填 0/负数，或值明显写错 >120，或拿不到
+        小地图全局坐标 ⇒ 测不到竖向进展、不该猜）。
+
+        由来（用户 m10830「把'人眼的实时反应'拆解成'适合低频检测的确认流程'」）：
+          真机取证（`log/MSBot_2026-10-14_17-40-51.log` 段11，152 分钟）——
+          >10s 的打怪空档 105 次合计 2726s（占 30%），其中 **104 次含 `[绳/梯]`
+          事件**；**87 次（1540s = 会话的 17%）角色"几乎没动"**（净位移 ≤8px），
+          而这 87 次里"发键 0 次"的采样是 **0/317**（键一直在发、90~96 次/5s）——
+          即**一直按着 up 顶着绳/墙，同时怪逻辑被 `_ladder_yield()` 整段静音**。
+          最长一次 211 秒。人眼在这种场景里的做法是"看一眼、够不着就干别的去"，
+          不是"盯着一根上不去的绳子按 211 秒"。
+        '''
+        try:
+            _raw = (self.cfg.get("route") or {}).get("rope_stuck_s", 8.0)
+        except Exception:                                     # noqa: BLE001
+            _raw = 8.0
+        if _raw is None:
+            _raw = 8.0
+        try:
+            _v = float(_raw)
+        except (TypeError, ValueError):
+            _v = 8.0
+        if _v <= 0 or _v > 120:       # 非法 / 明确关掉 ⇒ 本层不可用
+            return 0.0
+        if getattr(self, "loc_player_global", None) is None:
+            return 0.0                # 拿不到全局坐标 ⇒ 测不到竖向进展
+        return _v
+
+    def _rope_giveup_now(self):
+        '''本帧是否处在「这根绳判定上不去、暂停爬绳」的窗口里（**纯读**，不改状态）。'''
+        return time.time() < float(getattr(self, "_rope_giveup_until", 0.0) or 0.0)
+
+    def _rope_ladder_giveup_tick(self):
+        '''
+        爬绳 give-up 的状态机 —— **只有这一处写状态**；返回 True = 本帧在暂停爬绳。
+
+        判据：路线要求 up/down 已持续 ≥ `rope_stuck_s` 秒，**且**同期小地图全局 y
+        没有任何竖向进展（`t_ladder_move` 不新鲜）⇒ 判定"这根绳上不去"，进入暂停
+        窗口 `rope_stuck_s` 秒。窗口里：
+          · `_ladder_yield()` 不再让路 ⇒ **怪逻辑恢复**（这是用户 m10830 取证里
+            占会话 17% 那一项的正解）；
+          · `update_cmd_by_route` 把 up/down 压成 none ⇒ 不再死按着方向键。
+        一旦真的出现竖向进展（`t_ladder_move` 新过窗口起点）⇒ 立刻取消暂停，
+        把控制权立刻还给路线（不许"人已经在爬了、怪逻辑还回来抢"）。
+        '''
+        _now = time.time()
+        _stuck = self._rope_stuck_s()
+        if _stuck <= 0:                       # 本层关掉 ⇒ 清窗口，退回老行为
+            self._rope_giveup_until = 0.0
+            return False
+        _last = float(getattr(self, "t_ladder_move", 0.0) or 0.0)
+        _give = float(getattr(self, "_rope_giveup_until", 0.0) or 0.0)
+        if _now < _give:
+            if _last > float(getattr(self, "_rope_giveup_stamp", 0.0) or 0.0):
+                self._rope_giveup_until = 0.0     # 有进展 ⇒ 立刻取消暂停
+            else:
+                return True
+        _cmd_now = str(self.cmd_move_y)
+        if _cmd_now not in ("up", "down"):        # 路线没在要求爬 ⇒ 重新起表
+            self._rope_req_t0 = 0.0
+            self._rope_req_cmd = ""
+            return False
+        _t0 = float(getattr(self, "_rope_req_t0", 0.0) or 0.0)
+        if _t0 <= 0 or str(getattr(self, "_rope_req_cmd", "")) != _cmd_now:
+            self._rope_req_t0 = _now              # 新的一次爬绳尝试，重新计时
+            self._rope_req_cmd = _cmd_now
+            return False
+        _age_req = _now - _t0
+        _age_move = (_now - _last) if _last > 0 else _age_req
+        if _age_req < _stuck or _age_move < _stuck:
+            return False
+        self._rope_giveup_until = _now + _stuck
+        self._rope_giveup_stamp = _last
+        self._rope_req_t0 = _now                  # 下一次尝试重新计时
+        if _now - float(getattr(self, "t_rope_giveup_log", 0.0) or 0.0) > 5.0:
+            self.t_rope_giveup_log = _now
+            logger.warning(
+                f"[爬绳] 路线要求 {_cmd_now} 已 {int(_age_req)}s、期间没有竖向进展"
+                f"（全局 {tuple(self.loc_player_global) if self.loc_player_global else '?'}）"
+                f" ⇒ 判定这根绳上不去，暂停爬绳 {int(_stuck)}s："
+                f"不再按 {_cmd_now}、怪逻辑恢复（用户 m10830；"
+                f"`route.rope_stuck_s` 填 0 = 关掉本层）")
+            self._budget_note_lost("爬绳放弃(次)")
+        return True
+
     def _ladder_yield(self):
         '''
         「本帧要不要给绳/梯让路」—— 唯一判据点（让路块只调这一个）。
@@ -6154,16 +6418,21 @@ class MapleStoryAutoBot:
         三路，任一成立即让路：
           ① 路线本帧给的 `cmd_move_y` 是 up/down —— **始终让路**（拉绳只由路线负责，
              见让路块 `:5900` 那段真机现场；本路不受 `ladder_still_s` 影响）；
+             ★ 2026-10-14（P0，用户 m10830）：但**爬了 `rope_stuck_s` 秒还没上去**
+             就不再让路 —— 见 `_rope_ladder_giveup_tick()`（那 17% 的静音就是这里）；
           ② `is_on_ladder` 为真 **且** 最近 `ladder_still_s` 秒内有过竖向进展
              （小地图全局 y 变过）；
           ③ `_ladder_still_s()` 返回 0.0（判据不可用）**且** `is_on_ladder` 为真
              ⇒ fail-closed 退回老行为。
         返回 `(让路吗, 为什么)`，`为什么` 直接进日志，方便用户核对"这次为什么没打"。
         '''
+        _giveup = self._rope_ladder_giveup_tick()
         if str(self.cmd_move_y) in ("up", "down"):
             _why = f"路线指令 y={self.cmd_move_y}"
             if self.is_on_ladder:
                 _why += "、且在梯子上（is_on_ladder）"
+            if _giveup:
+                return False, ""     # 这根绳判定上不去 ⇒ 把控制权交回怪逻辑
             return True, _why
         if not self.is_on_ladder:
             return False, ""
@@ -6277,6 +6546,106 @@ class MapleStoryAutoBot:
             return ""                          # 这一档的"蹭"已经用完，只按 up 等判定
         return "right" if _slot % 2 == 0 else "left"
 
+    def _ladder_finish_cfg(self):
+        '''
+        爬梯"走完"的两个参数 —— **只有这一处读配置**。
+
+        对应 `config/config_default.yaml` 的 `route.ladder_finish`（总开关）与
+        `route.ladder_finish_s`（补多久还没进展就冷却同样长的时间）。
+
+        Returns:
+            (on, max_s)；`on=False` 或 `max_s <= 0` ⇒ **关掉本层**（逐字退回老行为）。
+        '''
+        _r = self.cfg.get("route") or {}
+        _on = bool(_r.get("ladder_finish", True))
+        try:
+            _s = float(_r.get("ladder_finish_s", 6.0))
+        except (TypeError, ValueError):
+            _s = 6.0
+        if _s != _s or _s > 120.0:          # NaN / 越界 ⇒ 退回出厂值
+            _s = 6.0
+        return _on, _s
+
+    def _ladder_finish_tick(self):
+        '''
+        本帧要不要"补一个竖向指令、把梯子走完" —— **唯一判据、也是唯一改状态的地方**。
+
+        背景（用户 m11669 原文：「上梯子要走完，不要检测怪了，现在会走上梯子后，
+        发现有怪就卡在梯子上」+ 真机取证 `log/MSBot_2026-10-15_00-36-31.log`）：
+          · 角色挂在梯子上时**按左右键是不动的**（人还挂在绳上），只有 up/down 能走；
+          · 而路线这帧未必给竖向 —— 最近的可走路线像素可能是横向的（
+            `elif color_code:` 那条路直接 `cmd_move_x, cmd_move_y, cmd_action = …`），
+            也可能是同列的 up 像素被"防地面伪灰"判掉 ⇒ 指令里 `y=none`；
+          · 于是出现"键一直在发（90~96 次/5s）、全局坐标一动不动"的僵持：
+            实测 26 分钟里 (210,60) 停了 30s（竖向指令 0/6 帧）、(78,74) 停 15s、
+            (180,64) 停 15s；跨轮取证里这一类占会话 17%（87 段 / 1540s）。
+          · 同时 `_ladder_yield()` 此时判"没在爬"⇒ 怪逻辑被放进来 ⇒ 站桩打怪。
+
+        判据（全部成立才补）：
+          ① `route.ladder_finish` 打开且 `ladder_finish_s` > 0；
+          ② `is_on_ladder` 为真（引擎自己说"人在梯子上"—— 本层只信这面旗子）；
+          ③ 本帧路线**没给**竖向（`cmd_move_y` 不是 up/down）；
+          ④ 不在 P0 的"爬绳放弃"窗口里（那 8 秒归 P0，别抢）；
+          ⑤ 没在冷却期（上一轮补够时间还没进展 ⇒ 让它歇同样长的时间）。
+        方向：路线最近一次给的竖向指令（`_last_vert_cmd`，默认 up）。
+
+        ⚠️ 退出靠既有的两条：① 引擎的"离开梯子"判据（全局 x 变化 ≥
+        `route.ladder_leave_x`、或屏幕 dx > 3）⇒ 旗标转假 ⇒ 本层下一帧自动停；
+        ② 本层的超时 —— 补了 `ladder_finish_s` 秒、全局 y 一直没动 ⇒ 判定"按上去
+        也没用"，冷却同样长的时间（日志 `[爬梯] …`），避免在梯子顶端把横向走位
+        一直压住。
+
+        ⚠️ 补上竖向之后，`_ladder_yield()` 的判据①（路线给 up/down ⇒ 始终让路）会
+        自然生效 ⇒ **怪逻辑全程静音**，这正是用户要的"不要检测怪了"。
+
+        Returns:
+            "up" / "down" / ""（"" = 本帧不补，路线指令照旧）
+        '''
+        _on, _maxs = self._ladder_finish_cfg()
+        _now = time.time()
+        if not _on or _maxs <= 0:
+            self._ladder_push_t0 = 0.0
+            return ""
+        if not getattr(self, "is_on_ladder", False):
+            self._ladder_push_t0 = 0.0
+            return ""
+        if str(self.cmd_move_y) in ("up", "down"):
+            self._ladder_push_t0 = 0.0      # 路线自己给了竖向 ⇒ 不补
+            return ""
+        if self._rope_giveup_now():
+            self._ladder_push_t0 = 0.0      # P0 的窗口里不抢
+            return ""
+        if _now < float(getattr(self, "_ladder_push_cool", 0.0) or 0.0):
+            return ""                       # ⑤ 冷却中
+        _t0 = float(getattr(self, "_ladder_push_t0", 0.0) or 0.0)
+        if _t0 <= 0.0:
+            _t0 = _now
+        _move = float(getattr(self, "t_ladder_move", 0.0) or 0.0)
+        _age_move = (_now - _move) if _move > 0.0 else (_now - _t0)
+        if (_now - _t0) >= _maxs and _age_move >= _maxs:
+            # 补够了、全局 y 一直没动 ⇒ 按上去也没用，冷却同样长的时间
+            self._ladder_push_cool = _now + _maxs
+            self._ladder_push_t0 = 0.0
+            if _now - float(getattr(self, "t_ladder_finish_log", 0.0) or 0.0) > 1.5:
+                self.t_ladder_finish_log = _now
+                logger.warning(
+                    f"[爬梯] 在梯子上补了 {int(_now - _t0)}s 竖向、全局 y 一直没动"
+                    f" ⇒ 冷却 {int(_maxs)}s 不再补（交给路线/绳梯自救；"
+                    f"`route.ladder_finish_s` 填 0 = 关掉本层）")
+            return ""
+        _dir = str(getattr(self, "_last_vert_cmd", "up") or "up")
+        if _dir not in ("up", "down"):
+            _dir = "up"
+        self._ladder_push_t0 = _t0
+        if _now - float(getattr(self, "t_ladder_finish_log", 0.0) or 0.0) > 1.5:
+            self.t_ladder_finish_log = _now
+            logger.info(
+                f"[爬梯] 还在梯子上、路线这帧没给上下"
+                f"（指令 {self.cmd_move_x} none {self.cmd_action}）"
+                f" → 补 {_dir} 把梯子走完（已补 {int(_now - _t0)}s、"
+                f"怪逻辑同时让路；`route.ladder_finish_s` 填 0 = 关掉本层）")
+        return _dir
+
     def update_cmd_by_mob_detection(self):
         # Get monster search box
         # ── 感知框 / 攻击框分开（2026-10-13 加，用户选的方案 A）──────────────
@@ -6376,6 +6745,9 @@ class MapleStoryAutoBot:
         #   ⚠️ 别把这里放宽成"只让 x"：路线的 up 被清掉一样会吊在绳上。
         _climbing, _why = self._ladder_yield()
         if _climbing:
+            # ★ P4 纯观测（2026-10-14）：这一帧的怪逻辑是被让路吃掉的 —— 记账，
+            #   好在 [开火预算] 里看出"没打成"有多少来自绳/梯（真机占 17% 会话时间）。
+            self._budget_note_lost("被让路(帧)")
             if getattr(self, "_stop_hold", False):
                 # 已经站定了，现在路线在爬 → 立刻把走位交回路线（不许钉在绳上）
                 self._stop_hold = False
@@ -6748,6 +7120,9 @@ class MapleStoryAutoBot:
                             f"画出来的框是索敌框 约 ±{_sbx}×±{_sby}px）")
                 else:
                     # 看得见却够不着，但本帧没追过去（还没凑齐"连续两次确认"，或都在别的层）
+                    # ★ P4 纯观测（2026-10-14）：这一条就是"确认没凑齐"的账
+                    #   （含"只认到一帧"与"候选全在别的层"两种情形，后者另有高差账）
+                    self._budget_note_lost("未确认(次)")
                     self._mob_no_attack_log("approach_pending", far_n=len(_far),
                                             half_x=_ax, half_y=_ay,
                                             **self._engage_gap_facts(_far))
@@ -7332,6 +7707,9 @@ class MapleStoryAutoBot:
                 f" 名字命中{self.nametag_hit}(miss{self.nametag_miss_streak})")
             # 2026-10-14 加：[出招] 心跳（纯观测，紧跟 [运行状态] 的 5 秒节拍）
             self._log_attack_heartbeat()
+            # 2026-10-14 加（P4，用户 m10830）：[开火预算] —— 把"看见→出刀"拆成
+            #   三段 + 覆盖率 + 没打成的账（同一节拍；跟 detect_log 同一个开关）
+            self._log_fire_budget()
 
         # ── 性能埋点：紧跟 [运行状态]，同样每 5 秒一条 ─────────────────
         # 位置有讲究：必须在「关掉可视化就提前 return」**之前** —— 这次排查

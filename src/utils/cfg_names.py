@@ -109,6 +109,33 @@ KEY_CN = {
     "fps_limit_window_capturor": "截图线程帧率上限",
     "fps_limit_route_recorder": "路线录制帧率上限",
     "language": "界面语言",
+    # ── 2026-10-14 补齐：高级设置页要逐参数给说明与参考值，
+    #    这些键以前没有中文名（页面上直接显示英文 key）────────────────────
+    "match_all_mobs": "怪物模板加载范围（true=全部 / false=只本图登记的）",
+    "draw_mob_boxes": "在游戏画面里给每只怪画框（诊断用）",
+    "confirm_frames": "连续几帧都低于阈值才喝（防抖）",
+    "hp": "血量档位（按阈值从小到大，逐档喝药）",
+    "mp": "蓝量档位（同血量档位）",
+    "hp_cooldown_sec": "两次喝红药之间的最短间隔（秒）",
+    "mp_cooldown_sec": "两次喝蓝药之间的最短间隔（秒）",
+    "split_width_fallback": "兜底匹配的切块宽度（0=关闭兜底）",
+    "pingpong_single_route": "单段往返：只录了一段路时走到头自动掉头",
+    "pingpong_turn_range": "往返掉头：离起点多近算走到（像素）",
+    "goal_reach_range": "离本段终点多近算走完、该切段（像素）",
+    "goal_reach_y_tol": "切段的高度容差（像素）",
+    "endpoint_margin": "端点安全余量（终点朝段内收缩的像素）",
+    "edge_guard": "平台边缘硬保护（到边界强制改向，防掉下去）",
+    "edge_guard_row_tol": "边缘保护按行取值时的高度容差（像素）",
+    "edge_guard_react_frames": "边缘保护：往前看几帧的位移（反应延迟补偿）",
+    "edge_guard_inset": "边缘保护：边界往里收多少像素（0=不收）",
+    "patrol_min_gap": "窄平台降级阈值：相邻终点间距小于它就判定不值得巡逻（像素）",
+    "home_recenter": "回正线：归位到中心（false=关掉归位）",
+    "home_recenter_frames": "回正线：归位最多走几帧就放弃",
+    "home_jump_brake": "回正线：跳跃刹车（true 会破坏跨缺口地形）",
+    "home_jump_brake_frames": "回正线：跳跃刹车最多等几帧",
+    "rescue_range": "失联救援半径（像素）",
+    "home_jump_band_max_drop": "回正线：认头顶上方主线的最大落差（行）",
+    "home_jump_band_inset": "回正线：原地跳区间距平台边缘的安全余量（像素）",
 }
 
 # 同名 key 在不同分组含义不同时，用 "分组.字段" 精确覆盖
@@ -150,10 +177,19 @@ SECTION_KEY_CN = {
     "route.rope_nudge_ms": "绳梯脚下自救：每次蹭多少毫秒",
     "route.rope_nudge_cycle_s": "绳梯脚下自救：两次蹭之间隔多少秒",
     "route.rope_nudge_max_s": "绳梯脚下自救：蹭多久还没动就放弃（秒，之后退回老行为）",
+    # 2026-10-14（用户 m10830「人眼实时反应 → 低频确认流程」）：爬绳"上不去就算了"。
+    #   界面上不显示（同 ladder_leave_x / rope_nudge_s 口径：算法判据），
+    #   但 `[爬绳]` 那行日志会点名这个键，用户去 yaml 里能找到。
+    "route.rope_stuck_s": "爬绳超时：路线要上/下持续这么久还没竖向进展就暂停爬绳（秒；0=关掉本层）",
     # 2026-10-14（用户拍板 E1）：goal 像素不再吃掉整帧。
     #   界面上不显示（同 ladder_leave_x / ladder_still_s / rope_nudge_s 口径：
     #   算法判据），但日志里 `[路线·goal过滤]` 那行会点名它，去 yaml 里能找到。
     "route.goal_pixel_skip": "goal 像素过滤（1=开：站在本段终点正下方时不再收到不会动的 `none none goal` 指令；0=关回老行为）",
+    # 2026-10-15（用户 m11669「上梯子要走完，不要检测怪了」）：在梯子上、路线没给
+    #   上下时，替路线补一个竖向指令把梯子走完（补上后怪逻辑自动全程让路）。
+    #   界面上不显示（同上口径：算法判据），但日志里 `[爬梯]` 那行会点名它。
+    "route.ladder_finish": "爬梯走完：在梯子上、路线没给上下时替它补竖向（1=开；0=关掉本层，逐字退回老行为）",
+    "route.ladder_finish_s": "爬梯走完：补了这么久、全局 y 一直没动就冷却同样长的时间（秒；≤0=关掉本层）",
 
     # ── route_recoder：v0.9 手绘回正线面板参数 ────────────────────────────
     "route_recoder.home_draw_scale": "手绘画布放大倍数",

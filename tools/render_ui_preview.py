@@ -39,7 +39,10 @@ def main():
     app = QApplication([])
     win = MainWindow(controller=DummyController())
 
-    for index, name in enumerate(["主界面", "高级设置", "游戏画面", "路线地图", "工具箱"]):
+    # 页签名单直接问控件（2026-10-14：硬编码的名单在页签重排后就过期了，
+    # 而且"名字→下标"假设一旦错位，截出来的是别的页、还照样报成功）
+    names = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+    for index, name in enumerate(names):
         try:
             win.tabs.setCurrentIndex(index)
             app.processEvents()

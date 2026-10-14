@@ -547,9 +547,12 @@ print("\n【6.7】★ 真绳梯在当前段图上（up 像素落在角色这一�
 # ⇒ 角色从绳梯脚下直接走过去、全程不按 up（真机 17:23:24 全局 (178,78) 指令 right none none）。
 # 修法：判"是不是真绳梯"时同时看**当前段**路线图（同列 ±1px、上下 3px 内有竖向色码）。
 
-def _fakeup_cmd(with_rope):
+def _fakeup_cmd(with_rope, giveup=False, on_ladder=False, ladder_finish=None):
     '''合成 40×40 段图：(20,19) 一个 right、(20,20) 一个 up（正好在角色这一行）；
-       with_rope=True 时在 (20,19)/(20,18) 追两个 up 像素 = 真绳梯的连续竖向。'''
+       with_rope=True 时在 (20,19)/(20,18) 追两个 up 像素 = 真绳梯的连续竖向。
+       giveup=True 时先摆出 P0 的"暂停爬绳"窗口（`_rope_giveup_until` 在未来）。
+       on_ladder=True 时把 `is_on_ladder` 旗标摆真（爬梯走完那层的入口条件）；
+       ladder_finish=False 时把 `route.ladder_finish` 关掉（回滚口径对照）。'''
     b = new_bot(player_global=(20, 20))
     b.color_code = {k: v for k, v in b.color_code.items()
                     if k not in {(127, 127, 127), (255, 255, 127)}}
@@ -568,6 +571,16 @@ def _fakeup_cmd(with_rope):
     b.img_route_home = np.zeros((40, 40, 3), np.uint8)   # 回正线里这一列没有竖向像素
     b._build_mainline_cache()
     b.home_lines = []
+    if giveup:
+        # ★ P0（2026-10-14，用户 m10830）：模拟"这根绳判定上不去"的暂停窗口
+        b._rope_giveup_until = time.time() + 5.0
+    if on_ladder:
+        # ★ 爬梯走完（2026-10-15，用户 m11669）：引擎自己说"人在梯子上"，
+        #   但这一帧路线只给了横向（with_rope=False）⇒ 正是真机里"键在发、人不动"那种帧。
+        b.is_on_ladder = True
+        b.t_ladder_move = time.time() - 30.0     # 30s 没有竖向进展
+    if ladder_finish is not None:
+        b.cfg["route"]["ladder_finish"] = ladder_finish
     return frame(b)
 
 _rope_cmd = _fakeup_cmd(True)
@@ -577,6 +590,35 @@ check("★ 真绳梯（当前段图上同列有连续竖向像素）→ 发 up�
 check("对照：孤立灰（同列上下没有竖向延续）仍按伪灰处理 → 走横向",
       (_fake_cmd[0], _fake_cmd[1]), ("right", "none"))
 print(f"       真绳梯 {_rope_cmd} ｜ 孤立灰 {_fake_cmd}")
+
+# ★ P0（2026-10-14，用户 m10830）：爬绳超时 ⇒ 暂停期间**不再死按 up**。
+#   真机取证（log/MSBot_2026-10-14_17-40-51.log 段11，152 分钟）：>10s 的打怪空档
+#   105 次里 87 次（1540s = 会话 17%）角色几乎没动（净位移 ≤8px）、而发键 90~96 次/5s
+#   ⇒ 一直按着 up 顶着绳；同时怪逻辑被让路块整段静音（最长一次 211s）。
+_giveup_cmd = _fakeup_cmd(True, giveup=True)
+check("★ P0：暂停爬绳期间同一张图不再发 up（改发 none，控制权交回怪逻辑）",
+      _giveup_cmd[1], "none")
+check("★ P0：暂停期间只压竖向 —— 横向/动作照旧（不许把整条指令清掉）",
+      (_giveup_cmd[0], _giveup_cmd[2]), (_rope_cmd[0], _rope_cmd[2]))
+print(f"       P0 暂停期 {_giveup_cmd} ｜ 正常 {_rope_cmd}")
+
+# ★ 爬梯走完（2026-10-15，用户 m11669「上梯子要走完，不要检测怪了」）：
+#   真机取证（log/MSBot_2026-10-15_00-36-31.log，26 分钟）：全局坐标连续 ≥5s 不动的
+#   8 段**全部是"竖向指令 0/N 帧"**（30s @(210,60)、15s @(78,74)、15s @(180,64)…）
+#   —— 梯子上按左右键是不动的，而路线这帧只给了横向 ⇒ 键在发、人不动，
+#   同时 `_ladder_yield()` 判"没在爬"⇒ 怪逻辑被放进来站桩打怪。
+_ladder_cmd = _fakeup_cmd(False, on_ladder=True)
+check("★ 爬梯走完：在梯上、路线这帧只给横向 ⇒ 替它补 up（而不是照抄横向）",
+      (_ladder_cmd[0], _ladder_cmd[1]), ("right", "up"))
+check("★ 爬梯走完：只补竖向 —— 动作照旧（不许顺手改动作/横向）",
+      _ladder_cmd[2], _fake_cmd[2])
+_off_cmd = _fakeup_cmd(False, on_ladder=True, ladder_finish=False)
+check("★ 爬梯走完：route.ladder_finish=false ⇒ 逐字退回老行为（这就是回滚口径）",
+      (_off_cmd[0], _off_cmd[1]), ("right", "none"))
+_no_ladder_cmd = _fakeup_cmd(False, on_ladder=False)
+check("对照：不在梯子上 ⇒ 不补（本层只信 is_on_ladder）",
+      (_no_ladder_cmd[0], _no_ladder_cmd[1]), ("right", "none"))
+print(f"       梯上路线只给横向 {_ladder_cmd} ｜ 关掉本层 {_off_cmd} ｜ 不在梯上 {_no_ladder_cmd}")
 
 print("\n【7】覆盖模拟 simulate_coverage：L 形 15/15，只画竖线接不住")
 landing = [(x, PIT_Y) for x in range(PIT_X0, PIT_X1 + 1)]

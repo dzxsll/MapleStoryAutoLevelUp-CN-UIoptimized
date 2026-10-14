@@ -28,7 +28,9 @@ from src.utils.logger import logger
 from src.utils.ui import (
     validate_numerical_input, clear_debug_canvas,
     create_error_label, SingleKeyEdit, QtLogHandler, create_advance_setting_gbox,
+    set_gbox_internal_visible,
 )
+from src.utils.cfg_docs import load_field_docs
 from src.utils.common import (
     load_yaml, override_cfg, save_yaml, get_cfg_diff, load_yaml_with_comments
 )
@@ -37,11 +39,22 @@ from src.utils.paths import resource_path, APP_ROOT, IS_FROZEN
 # window size for each tab
 TAB_WINDOW_SIZE = {
     '主界面': (700, 800),
-    '高级设置': (750, 800),
-    '游戏画面': (1502, 844),
+    '调试': (620, 960),
+    '高级设置': (820, 800),
+    '游戏画面': (1502, 844),   # 2026-10-14 起不再是独立页签（并入「调试」），保留兼容
     '路线地图': (800, 800),
     '工具箱': (800, 860),
 }
+
+# 「调试」页里游戏画面 / 路线地图两块画布的初始尺寸（2026-10-14 用户指定 526×216）
+DEBUG_CANVAS_SIZE = (526, 216)
+
+# 高级设置页的分组（2026-10-14 用户指定）：桶名 -> 这一桶里放哪几段配置
+ADV_TAB_GROUPS = [
+    ("🎯 识别与出手", ['monster_detect', 'potion']),
+    ("🧭 路线·梯子与「走丢」", ['route']),
+    ("🏷️ 名字定位", ['nametag']),
+]
 
 # ===== 高级设置的瘦身清单 =====
 # 这两张表只影响「高级设置页显示什么」，**不动任何功能** ——
@@ -141,6 +154,15 @@ ADV_FIELD_HIDE = {
               #   "一直站着按 up"的老行为），不放界面。
               'rope_nudge_s', 'rope_nudge_ms', 'rope_nudge_cycle_s',
               'rope_nudge_max_s',
+              # 2026-10-14（用户 m10830）：爬绳"上不去就算了"的窗口。
+              #   同上：算法判据，改错会把爬梯搞坏（填 0 就退回
+              #   "路线给 up/down 就一直让路"的老行为），不放界面。
+              'rope_stuck_s',
+              # 2026-10-15（用户 m11669「上梯子要走完，不要检测怪了」）：
+              #   在梯子上、路线没给上下时替它补一个竖向指令。
+              #   同上：算法判据（`ladder_finish: false` 或 `ladder_finish_s: 0`
+              #   就逐字退回"路线不给竖向就不按上下"的老行为），不放界面。
+              'ladder_finish', 'ladder_finish_s',
               # 2026-10-14（用户拍板 E1）：goal 像素不再吃掉整帧。
               #   同上：算法判据（填 0 退回"最近像素是谁就用谁"的老行为），不放界面；
               #   判据不可用时本层自动不生效，见 _goal_pixel_skip_params()。
@@ -736,6 +758,12 @@ class MainWindow(QMainWindow):
 
         # Load default yaml as base config
         _, self.comments, self.comments_section = load_yaml_with_comments("config/config_default.yaml")
+        # 参数说明/参考值的**权威来源**（2026-10-14 加）：按行读原文，
+        # 说明 = 紧贴该键上方的那段 # 注释。
+        # ⚠️ 不用 self.comments —— 那是 ruamel 的 ca.items[key][2]（键**下方**那段），
+        #    在本仓库的注释写法下会整体错位一格（每个键显示的是下一个键的说明）。
+        #    详见 src/utils/cfg_docs.py 的模块注释与 tools/verify_ui_tabs.py 的三条断言。
+        self.field_docs, self.field_docs_section = load_field_docs("config/config_default.yaml")
         self.cfg_base = load_yaml("config/config_default.yaml")
         self.cfg = copy.deepcopy(self.cfg_base)
         self.path_cfg_custom = "config/config_custom.yaml" # Custom config path
@@ -749,22 +777,26 @@ class MainWindow(QMainWindow):
         self.resize(TAB_WINDOW_SIZE['主界面'][0],
                     TAB_WINDOW_SIZE['主界面'][1])
 
-        # Setup tabs
+        # Setup tabs —— 页签布局（2026-10-14 用户重排）：
+        #   主界面   = 开跑要用的旋钮（控制/攻击/怪物识别/按键/拾取/宠物/地图/喝药）
+        #   调试     = 所有「看」的东西集中一页：游戏画面 / 路线地图 / 示范录制 / 日志
+        #   高级设置 = 参数全表（识别与出手 / 路线·梯子与走丢 / 名字定位）+ 说明与参考值
+        #   工具箱   = 验证 / 登记 / 诊断
+        #
+        # 【为什么把示范录制与日志从主界面搬走】主界面是"开跑"页：以前日志窗吊在
+        #   最下面，把 700×800 的窗口撑满，想点「开始」得先往下滚；而它们在语义上
+        #   都属于"看数据 / 排查"。搬到调试页后主界面只剩要填要点的东西。
         self.tabs = QTabWidget()
-        # 高级设置页签已移除（2026-09-12 用户决定）：里面的参数走配置文件默认值，
-        # 需要调整时由 AI 直接改 config_custom.yaml。保留空字典以兼容
-        # set_gbox_enabled / update_advance_setting_ui_from_cfg 的遍历；
-        # setup_advance_setting_tab() 函数保留未挂载，将来要恢复随时加回。
         self.advance_settings_gboxes = {}
         self.tab_main = self.setup_main_tab()
-        self.tab_game_window_viz = self.setup_game_window_viz_tab()
-        self.tab_route_map_viz = self.setup_route_map_viz_tab()
+        self.tab_debug = self.setup_debug_tab()
+        self.tab_advance_setting = self.setup_advance_setting_tab()
         self.tab_toolbox = self.setup_toolbox_tab()
 
         # Add tabs to tab widget
         self.tabs.addTab(self.tab_main, "主界面")
-        self.tabs.addTab(self.tab_game_window_viz, "游戏画面")
-        self.tabs.addTab(self.tab_route_map_viz, "路线地图")
+        self.tabs.addTab(self.tab_debug, "调试")
+        self.tabs.addTab(self.tab_advance_setting, "高级设置")
         self.tabs.addTab(self.tab_toolbox, "工具箱")
 
         # Change tabs signals
@@ -925,6 +957,19 @@ class MainWindow(QMainWindow):
         scroll_widget = QWidget()
         scroll_layout = QVBoxLayout(scroll_widget)
 
+        # 🎥 示范录制「交接中」横幅（2026-10-14 加）——
+        #    交接模式（demo_record.record_only=true）会把键盘静音：机器人一个键都不发。
+        #    原来只在日志里写一句，而日志区已经挪到「调试」页 ⇒ 主界面根本看不到，
+        #    症状又回到"点了开始，角色一动不动"（静默失败）。
+        #    所以主界面必须有一条**常驻**提示，且由 _refresh_demo_banner() 按真实状态自愈。
+        self.demo_banner = QLabel()
+        self.demo_banner.setWordWrap(True)
+        self.demo_banner.setStyleSheet(
+            "background-color:#3a2f00; color:#ffd76a; border:1px solid #8a7000;"
+            "padding:6px; font-size:12px;")
+        self.demo_banner.setVisible(False)
+        scroll_layout.addWidget(self.demo_banner)
+
         # Control group box
         self.control_gbox = self.create_control_gbox()
         scroll_layout.addWidget(self.control_gbox)
@@ -957,13 +1002,8 @@ class MainWindow(QMainWindow):
         self.potion_gbox = self.create_potion_gbox()
         scroll_layout.addWidget(self.potion_gbox)
 
-        # 🎥 示范录制（2026-10-14 加）—— 放在日志窗前面，同属「取样 / 排查」类
-        self.demo_gbox = self.create_demo_gbox()
-        scroll_layout.addWidget(self.demo_gbox)
-
-        # Logger output window
-        self.log_gbox = self.create_log_gbox()
-        scroll_layout.addWidget(self.log_gbox)
+        # 🎥 示范录制 与 📜 日志：2026-10-14 搬到「调试」页（见 setup_debug_tab）——
+        #   它们在语义上属于"看数据 / 排查"，不该占着开跑页最下面那块地方。
         scroll_area.setWidget(scroll_widget)
 
         tab_main = QWidget()
@@ -972,47 +1012,130 @@ class MainWindow(QMainWindow):
 
         return tab_main
 
-    def setup_advance_setting_tab(self):
-        tab_advance_setting = QWidget()
+    def setup_debug_tab(self):
+        '''
+        🐞 调试页（2026-10-14 用户重排）
 
-        # Two vertical layouts side-by-side
-        left_col = QVBoxLayout()
-        right_col = QVBoxLayout()
+        用户指定的排布：**从上到下叠四个区域** ——
+          ① 游戏画面（实时截图 + 检测框）   初始 526×216
+          ② 路线地图（当前段 / 回正线 / 光标）初始 526×216
+          ③ 示范录制
+          ④ 日志                             可以长一点
 
-        # Distribute group boxes evenly between columns
-        self.advance_settings_gboxes = {}  # store title -> QGroupBox mapping
-        for idx, title in enumerate(self.cfg):
-            # Skip hide settings
-            if title in ADV_SETTINGS_HIDE:
-                continue
-            gbox = create_advance_setting_gbox(title, self.cfg,
-                                               self.comments,
-                                               self.comments_section,
-                                               hide_keys=ADV_FIELD_HIDE.get(title, ()))
-            self.advance_settings_gboxes[title] = gbox
-            if idx % 2 == 0:
-                left_col.addWidget(gbox)
-            else:
-                right_col.addWidget(gbox)
-
-        # Wrap columns in a horizontal layout
-        row_layout = QHBoxLayout()
-        row_layout.addLayout(left_col)
-        row_layout.addLayout(right_col)
-
-        # Make it scrollable (recommended for lots of settings)
+        【为什么不做二级页签】用户明确要求"从上到下叠"；四块都用 QScrollArea 兜底，
+        窗口不够高时滚动即可。
+        '''
         scroll_area = QScrollArea()
-        container = QWidget()
-        container.setLayout(row_layout)
-        scroll_area.setWidget(container)
         scroll_area.setWidgetResizable(True)
 
-        # Final layout for the tab
-        final_layout = QVBoxLayout()
-        final_layout.addWidget(scroll_area)
-        tab_advance_setting.setLayout(final_layout)
+        inner = QWidget()
+        layout = QVBoxLayout(inner)
+        layout.setSpacing(10)
 
+        # ① 游戏画面
+        self.debug_canvas = QLabel()
+        clear_debug_canvas(self.debug_canvas)
+        self.debug_canvas.setStyleSheet("background-color: black; color: white;")
+        self.debug_canvas.setFixedSize(DEBUG_CANVAS_SIZE[0], DEBUG_CANVAS_SIZE[1])
+        layout.addWidget(self._wrap_debug_area("🖥️ 游戏画面（实时截图 + 检测框）",
+                                               self.debug_canvas))
+
+        # ② 路线地图
+        self.route_map_canvas = QLabel()
+        clear_debug_canvas(self.route_map_canvas)
+        self.route_map_canvas.setStyleSheet("background-color: black; color: white;")
+        self.route_map_canvas.setFixedSize(DEBUG_CANVAS_SIZE[0], DEBUG_CANVAS_SIZE[1])
+        layout.addWidget(self._wrap_debug_area("🗺️ 路线地图（当前段 / 回正线 / 光标）",
+                                               self.route_map_canvas))
+
+        # ③ 示范录制（你玩，它录）
+        self.demo_gbox = self.create_demo_gbox()
+        layout.addWidget(self.demo_gbox)
+
+        # ④ 日志
+        self.log_gbox = self.create_log_gbox()
+        layout.addWidget(self.log_gbox)
+
+        layout.addStretch(1)
+        scroll_area.setWidget(inner)
+
+        tab_debug = QWidget()
+        outer = QVBoxLayout(tab_debug)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(scroll_area)
+
+        return tab_debug
+
+    def _wrap_debug_area(self, title, canvas):
+        '''把一块画布包成带标题的组框（调试页里用）'''
+        gbox = QGroupBox(title)
+        box_layout = QVBoxLayout(gbox)
+        box_layout.setContentsMargins(6, 6, 6, 6)
+        box_layout.addWidget(canvas)
+        return gbox
+
+    def setup_advance_setting_tab(self):
+        '''
+        ⚙️ 高级设置页（2026-10-14 恢复并改版）
+
+        用户要求：把「识别与出手 / 路线·梯子与「走丢」/ 名字定位」这些参数的设置
+        放到高级设置页里，**并给出说明和数值参考**。
+
+        结构 = 三个桶（ADV_TAB_GROUPS）+ 每个桶里放对应配置段 + 每个参数一行
+        「标签/控件 + 灰字说明 + 参考值」。
+
+        页顶的「显示内部参数」勾选框：默认只显示日常旋钮；勾上才把
+        ADV_FIELD_HIDE 里那些"改错会把挂机搞坏"的底层参数（rope_nudge_*、
+        home_* 回正阈值、色码表…）摆出来 —— 它们一直生效，只是默认收起来。
+        '''
+        tab_advance_setting = QWidget()
+        outer = QVBoxLayout(tab_advance_setting)
+
+        self.internal_params_cb = QCheckBox(
+            "显示内部参数（⚠️ 算法阈值，改错会让挂机行为异常；不确定就别动）")
+        self.internal_params_cb.setToolTip(
+            "默认只显示你需要调的旋钮。\n"
+            "勾上之后，各组里会多出底层参数（绳梯自救、回正线阈值、色码表、名字定位\n"
+            "的内部阈值…）。它们一直在生效 —— 只是改之前最好先问一下 AI。")
+        self.internal_params_cb.setChecked(False)
+        self.internal_params_cb.stateChanged.connect(self._on_internal_params_toggled)
+        outer.addWidget(self.internal_params_cb)
+
+        self.advance_settings_gboxes = {}  # section -> QGroupBox（set_gbox_enabled 等仍遍历它）
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        container = QWidget()
+        container_layout = QVBoxLayout(container)
+
+        for group_title, sections in ADV_TAB_GROUPS:
+            bucket = QGroupBox(group_title)
+            bucket_layout = QVBoxLayout(bucket)
+            for section in sections:
+                if section not in self.cfg:
+                    logger.error(f"[界面] 高级设置：配置里没有 {section} 段 —— 这一桶先放着")
+                    continue
+                gbox = create_advance_setting_gbox(
+                    section, self.cfg, self.comments, self.comments_section,
+                    hide_keys=ADV_FIELD_HIDE.get(section, ()),
+                    field_docs=self.field_docs,
+                    show_internal=self.internal_params_cb.isChecked())
+                self.advance_settings_gboxes[section] = gbox
+                bucket_layout.addWidget(gbox)
+            container_layout.addWidget(bucket)
+
+        container_layout.addStretch(1)
+        scroll_area.setWidget(container)
+
+        outer.addWidget(scroll_area)
         return tab_advance_setting
+
+    def _on_internal_params_toggled(self, state):
+        '''「显示内部参数」勾选框：把底层参数的行显示/隐藏（只影响显示，不动配置）'''
+        show = Qt.CheckState(state) == Qt.Checked
+        for gbox in self.advance_settings_gboxes.values():
+            set_gbox_internal_visible(gbox, show)
+        logger.info(f"[界面] 高级设置：内部参数{'显示' if show else '隐藏'}")
 
     def setup_game_window_viz_tab(self):
         tab_game_window_viz = QWidget()
@@ -2198,7 +2321,11 @@ class MainWindow(QMainWindow):
 
         self.log_output = QPlainTextEdit()
         self.log_output.setReadOnly(True)
-        self.log_output.setMaximumHeight(150)
+        # 2026-10-14：日志窗搬到「调试」页，用户要求"稍微长一点" —— 从原来的
+        #   maxHeight 150 改成 minHeight 280 / maxHeight 520：既给足可见行数，
+        #   又不会把整页挤到必须滚动才能看到下面的东西。
+        self.log_output.setMinimumHeight(280)
+        self.log_output.setMaximumHeight(520)
         # ⚠️ 必须显式钉死配色（2026-09-13 用户实测：日志**完全看不见**）。
         #    append_log 里文字颜色是硬编码的（INFO=白 / WARNING=橙 / ERROR=红），
         #    而这里不设背景的话，QPlainTextEdit 会跟着系统主题走 ——
@@ -2478,6 +2605,8 @@ class MainWindow(QMainWindow):
             self._flush_settings()
         except Exception as e:
             logger.error(f"[界面] 自动保存失败: {e}")
+        # 顺带让示范录制横幅跟着真实状态走（看门狗自动停、启动失败等路径也自愈）
+        self._refresh_demo_banner()
 
     def _on_config_activated(self, index):
         """用户从下拉列表选中一项 = 切换到那套配置（切换前先把当前修改落盘）。
@@ -2788,11 +2917,16 @@ class MainWindow(QMainWindow):
 
     def on_tab_changed(self, index):
         tab_name = self.tabs.tabText(index)
-        if tab_name == "游戏画面":
+        if tab_name in ("调试", "游戏画面", "路线地图"):
+            # 游戏画面 / 路线地图两块画布都在「调试」页里（2026-10-14 起），
+            # 所以进这一页就要开可视化。后两个名字只为兼容老布局留着。
             self.controller.enable_bot_viz()
 
-        elif tab_name == "路线地图":
-            self.controller.enable_bot_viz()
+        elif tab_name == "高级设置":
+            # 参数页不需要实时画面；进来时把 cfg 的当前值回填到控件上
+            # （主界面的改动、配置文件的手改，都能在这里看到）
+            self.controller.disable_bot_viz()
+            self.update_advance_setting_ui_from_cfg()
 
         elif tab_name == "主界面":
             self.controller.disable_bot_viz()
@@ -3051,6 +3185,38 @@ class MainWindow(QMainWindow):
             return False
         return box.clickedButton() is btn_go
 
+    def _refresh_demo_banner(self):
+        """🎥 示范录制「交接中」横幅 —— 主界面唯一的常驻提示（2026-10-14 加）。
+
+        为什么要有它：交接模式（`demo_record.record_only=true`）会把键盘静音，
+        机器人一个键都不发（见 `src/utils/demo_recorder.py` 文件头）。原来只在日志里
+        写一句，而日志区已经挪到「调试」页 ⇒ 主界面看不到，症状又变成
+        「点了开始，角色一动不动」（静默失败 —— 和"抓不到游戏画面"那类症状同源）。
+
+        判据取自**当前真实状态**（勾选着的开始按钮 + 配置里的交接模式），
+        所以在任何路径之后调一次都能自愈：正常暂停、启动失败、看门狗自动停。
+        """
+        try:
+            _d = self.cfg.get("demo_record") or {}
+            _handover = bool(_d.get("enabled")) and bool(_d.get("record_only", True))
+            _running = bool(self.button_start_pause.isChecked())
+            _want = _handover and _running
+            if _want and not self.demo_banner.isVisible():
+                _out = str(_d.get("out_dir") or "debug/demo")
+                self.demo_banner.setText(
+                    "🎥 示范录制中 —— **键盘已静音，现在轮到你操作**（机器人不会动）。\n"
+                    f"· 你正常玩就行：程序在后台录「画面 + 你按的键」，存到 {_out}/\n"
+                    "· 录完按 F1（暂停）结束这一次，文件立刻落盘"
+                    "（.jsonl.gz + 同名 _meta.json）。\n"
+                    "· 想让机器人边打边录：把「录制时接管键盘」取消勾选后再开始。")
+                self.demo_banner.setVisible(True)
+                logger.info("[示范录制] 主界面已显示「轮到你操作」横幅")
+            elif not _want and self.demo_banner.isVisible():
+                self.demo_banner.setVisible(False)
+                logger.info("[示范录制] 主界面横幅已收起")
+        except Exception as e:                                # noqa: BLE001
+            logger.error(f"[界面] 示范录制横幅刷新失败: {e}")
+
     def toggle_start_ui(self):
         if self.button_start_pause.isChecked(): # When start autobot
             self.update_cfg_from_main_ui()
@@ -3147,6 +3313,9 @@ class MainWindow(QMainWindow):
             self.set_gbox_enabled(True)
             clear_debug_canvas(self.debug_canvas) # Set debug viz to null
             clear_debug_canvas(self.route_map_canvas) # Set debug viz to null
+
+        # 开始/暂停两条路都走这里：横幅按"当前真实状态"自愈（含启动失败那一支）
+        self._refresh_demo_banner()
 
     def launch_nametag_calibration(self):
         # 名字在主界面的图形对话框里输入（中文输入法友好），工具拿 --name 直进框选，
@@ -4233,7 +4402,9 @@ class MainWindow(QMainWindow):
                 continue
             gbox = self.advance_settings_gboxes.get(title)
             if gbox is None:
-                continue  # 高级设置页签已移除，无对应控件组
+                # 2026-10-14 起高级设置只挂 ADV_TAB_GROUPS 里那三段
+                # （monster_detect / potion / route / nametag）⇒ 其余段没有控件组，跳过。
+                continue
             refs = getattr(gbox, "_field_refs", {})
             for key, value in self.cfg[title].items():
                 widget = refs.get(key)
@@ -4359,6 +4530,33 @@ class MainWindow(QMainWindow):
         '''
         Call when user close the UI window
         '''
+        # 🎥 录制中关窗口必须先问一句（2026-10-14 加）。
+        #    为什么：录制器按 max_minutes 分段换文件，正在写的那一段只有
+        #    停挂机（`MapleStoryAutoLevelUp.py:3970 self.demo.stop()`）才会收尾，
+        #    直接关界面 = 当前样本丢掉、`_meta.json` 也缺一条，事后完全看不出。
+        #    与 F12 那条路的分工：`_on_hotkey_close` 问的是"要不要关界面"，
+        #    用户对"正在录制"完全不知情 ⇒ 这里单独就录制问一次（只在真的在录时才问）。
+        try:
+            _d = self.cfg.get("demo_record") or {}
+            _recording = bool(_d.get("enabled")) and bool(
+                self.button_start_pause.isChecked())
+        except Exception:                                     # noqa: BLE001
+            _recording = False
+        if _recording:
+            if not self._ask_confirm(
+                    "正在录制示范样本",
+                    "示范录制还开着 —— 现在直接关界面，"
+                    "**正在录的这一段会丢**（压缩文件没写完、_meta.json 也不会有它）。\n\n"
+                    "点「停止并关闭」= 先停挂机、把当前样本落盘，再退出界面。",
+                    "停止并关闭", "取消"):
+                logger.info("[示范录制] 关窗被用户取消 —— 接着录，界面不关")
+                event.ignore()
+                return
+            logger.info("[示范录制] 关窗前先停挂机，把当前样本落盘")
+            self.button_start_pause.setChecked(False)
+            self.controller.pause_bot()
+            self._refresh_demo_banner()
+
         # Collect current UI setting and update to self.cfg
         self.update_cfg_from_main_ui()
         # 标定等工具可能在此期间写过磁盘配置 —— 合并后再算差异，避免覆盖（§8.7 同源问题）

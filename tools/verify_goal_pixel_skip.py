@@ -482,8 +482,12 @@ def main():
                   f"；新判据判成「没有可用像素」 {_n_new_none} 条")
             for _wc in _wrong_cases:
                 print(f"       · 残差 {_wc}")
-            check_true("样本够大、且日志里确实有 goal 指令（不是空跑）",
-                       _n_log_goal > 0, f"{_n_log_goal} 条")
+            # 锚点用「老判据会拿到 goal 像素」而不是「日志里当时发过 goal 指令」：
+            # 本层上线后，正是这些帧**不再**发 goal 指令（这就是修好的表现），
+            # 再拿"日志里有 goal 指令"当准入条件等于要求自己失效。
+            check_true("样本够大、且回放里确实存在「老判据会拿到 goal 像素」的帧（不是空跑）",
+                       _n_old_goal > 0,
+                       f"老判据 {_n_old_goal} 条 / 日志当时发过 goal 指令 {_n_log_goal} 条")
             check_true("★ 站在本段终点正下方时，新判据**不再**发 goal 指令",
                        _n_wrong == 0, f"{_n_wrong} 条")
             check_true("★ 那种帧改判成「没有可用像素」⇒ 交给回正线/救援接管",

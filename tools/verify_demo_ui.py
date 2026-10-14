@@ -165,9 +165,13 @@ def main():
           '合并逻辑只认那一处清单（managed = self._MANAGED_SECTIONS）')
 
     print('\n[5] 三处接线（缺一处 = 这个控件是装饰品）')
-    _s_setup = inspect.getsource(U.MainWindow.setup_main_tab)
-    check('create_demo_gbox()' in _s_setup, 'setup_main_tab() 里造了这个组框')
-    check('self.demo_gbox' in _s_setup, 'setup_main_tab() 里把它加进了布局')
+    # 2026-10-14：示范录制从「主界面」搬到「调试」页 ⇒ 挂载点跟着改
+    _s_setup = inspect.getsource(U.MainWindow.setup_debug_tab)
+    check('create_demo_gbox()' in _s_setup, 'setup_debug_tab() 里造了这个组框')
+    check('self.demo_gbox' in _s_setup, 'setup_debug_tab() 里把它加进了布局')
+    _s_main = inspect.getsource(U.MainWindow.setup_main_tab)
+    check('self.demo_gbox' not in _s_main and 'self.log_gbox' not in _s_main,
+          '主界面不再摆示范录制 / 日志（它们属于「调试」页）')
     _s_apply = inspect.getsource(U.MainWindow.apply_config_to_ui)
     check('_apply_demo_ui()' in _s_apply, 'apply_config_to_ui() 里灌了值')
     _s_read = inspect.getsource(U.MainWindow.update_cfg_from_main_ui)
@@ -185,6 +189,70 @@ def main():
           '两种模式都说清了（静音 = 你自己打 / 没静音 = 样本被污染）')
     check('录制中' in _s_toggle,
           '开始后按钮上标出「录制中」（用户一直在看的地方）')
+
+    print('\n[5c] 交接模式必须有一条**常驻**提示（2026-10-14 加，用户"点了开始一动不动"）')
+    # 为什么单独加这一节：日志区已经搬到「调试」页 ⇒ 主界面看不到那句 WARNING，
+    # 交接模式（键盘静音）又让角色一动不动 ⇒ 症状回到"程序坏了"。横幅是主界面上
+    # 唯一常驻可见的东西，所以要把它钉死：默认收起、交接中自动出现、停挂机自动收起。
+    from PySide6.QtWidgets import QLabel
+    _s_main_banner = inspect.getsource(U.MainWindow.setup_main_tab)
+    check('self.demo_banner' in _s_main_banner,
+          '主界面造了 self.demo_banner（日志搬到调试页后的唯一常驻提示）')
+    check('scroll_layout.addWidget(self.demo_banner)' in _s_main_banner,
+          '横幅真的加进了主界面布局（只造不加 = 用户看不见）')
+    _s_refresh = inspect.getsource(U.MainWindow._refresh_demo_banner)
+    check('record_only' in _s_refresh and 'isChecked()' in _s_refresh,
+          '横幅判据取自**真实状态**（交接模式 + 开始按钮），不是调用点传参')
+    check('setVisible(True)' in _s_refresh and 'setVisible(False)' in _s_refresh,
+          '横幅可显示也可收起（只显示不收起 = 停了还挂着"正在录制"）')
+    check('_refresh_demo_banner()' in _s_toggle,
+          '★ toggle_start_ui() 里开始/暂停两条路都会刷新横幅')
+    check('_refresh_demo_banner()' in inspect.getsource(U.MainWindow._autosave_tick),
+          '_autosave_tick() 里也刷新（看门狗自动停 / 启动失败等路径自愈）')
+    _banner_stub = _Stub()
+    _banner_stub.cfg = {'demo_record': {'enabled': True, 'record_only': True,
+                                        'out_dir': 'debug/demo'}}
+    _banner_stub.demo_banner = QLabel()
+    _banner_stub.demo_banner.setVisible(False)
+
+    class _Btn:
+        def __init__(self, on):
+            self._on = on
+
+        def isChecked(self):
+            return self._on
+
+    _banner_stub.button_start_pause = _Btn(True)
+    setattr(_banner_stub, '_refresh_demo_banner',
+            getattr(U.MainWindow, '_refresh_demo_banner').__get__(_banner_stub, _Stub))
+    _banner_stub._refresh_demo_banner()
+    check(_banner_stub.demo_banner.isHidden() is False,
+          '交接模式 + 挂机中 ⇒ 横幅出现')
+    check('轮到你操作' in _banner_stub.demo_banner.text(),
+          '横幅明说「轮到你操作」（这是用户唯一能看到的解释）')
+    check('F1' in _banner_stub.demo_banner.text()
+          and 'jsonl.gz' in _banner_stub.demo_banner.text(),
+          '横幅说清"怎么结束 + 文件在哪"（F1 / .jsonl.gz）')
+    _banner_stub.button_start_pause = _Btn(False)
+    _banner_stub._refresh_demo_banner()
+    check(_banner_stub.demo_banner.isHidden() is True,
+          '停挂机 ⇒ 横幅自动收起（不留"正在录制"的假象）')
+    _banner_stub.button_start_pause = _Btn(True)
+    _banner_stub.cfg = {'demo_record': {'enabled': True, 'record_only': False}}
+    _banner_stub._refresh_demo_banner()
+    check(_banner_stub.demo_banner.isHidden() is True,
+          '没开「接管键盘」时不出横幅（那时机器人照常打，不该吓用户）')
+
+    print('\n[5d] 录制中关窗口必须先问一句（否则当前样本静默丢掉）')
+    _s_close = inspect.getsource(U.MainWindow.closeEvent)
+    check('demo_record' in _s_close and '_ask_confirm' in _s_close,
+          '★ closeEvent() 会就"正在录制"问一次（不是只问"要不要关界面"）')
+    check('pause_bot()' in _s_close,
+          '确认后先停挂机 ⇒ 录制器收尾落盘（引擎 MapleStoryAutoLevelUp.py:3970 demo.stop()）')
+    check('event.ignore()' in _s_close,
+          '取消时拦下这次关闭（点了取消还把界面关掉 = 白问）')
+    check(_s_close.index('_ask_confirm') < _s_close.index('terminate_bot'),
+          '问在 terminate 之前（顺序反了 = 已经停了才问）')
 
     print('\n[6] 口径一致：有控件的键不进隐藏清单，且都有中文名')
     _hide = U.ADV_FIELD_HIDE.get('demo_record', ())

@@ -174,7 +174,11 @@ def make_stub(cfg, monsters=(), **kw):
                "_engage_margin", "_attack_boxes",
 
 
-               "_ladder_still_s", "_ladder_yield"):
+               "_ladder_still_s", "_ladder_yield",
+               "_rope_stuck_s", "_rope_giveup_now",
+               "_rope_ladder_giveup_tick", "_budget_note_lost",
+               # 爬梯走完（2026-10-15，用户 m11669）：路线侧每帧无条件问一次
+               "_ladder_finish_cfg", "_ladder_finish_tick"):
         setattr(s, _n, getattr(MapleStoryAutoBot, _n).__get__(s))
     s.cfg = cfg
     s.loc_player = PLAYER

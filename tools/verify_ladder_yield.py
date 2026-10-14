@@ -60,12 +60,19 @@ def check_true(name, cond, detail=""):
 
 
 def stub(cfg=None, **kw):
-    '''只绑本次两个新方法的假引擎（不跑 __init__）。'''
+    '''只绑本次这几个新方法的假引擎（不跑 __init__）。'''
     class S:
         pass
 
     s = S()
-    for _n in ("_ladder_still_s", "_ladder_yield"):
+    for _n in ("_ladder_still_s", "_ladder_yield",
+               "_rope_stuck_s", "_rope_giveup_now", "_rope_ladder_giveup_tick",
+               # P4（2026-10-14）：give-up 那一刻要记一笔账 ⇒ 桩也必须绑上，
+               # 否则 give-up 一触发就是 AttributeError（本次就是这么红的）
+               "_budget_note_lost",
+               # 爬梯走完（2026-10-15，用户 m11669）：路线侧每帧都会问一次
+               # （update_cmd_by_route 里无条件调用）⇒ 桩漏绑就是 AttributeError
+               "_ladder_finish_cfg", "_ladder_finish_tick"):
         setattr(s, _n, getattr(MapleStoryAutoBot, _n).__get__(s))
     s.cfg = cfg if cfg is not None else {}
     s.cmd_move_y = "none"
@@ -75,6 +82,10 @@ def stub(cfg=None, **kw):
     s.t_ladder_move = 0.0
     s._ladder_gy = None
     s.t_ladder_stale_log = 0.0
+    s._last_vert_cmd = "up"
+    s._ladder_push_t0 = 0.0
+    s._ladder_push_cool = 0.0
+    s.t_ladder_finish_log = 0.0
     s.loc_player_global = (100, 200)
     for k, v in kw.items():
         setattr(s, k, v)
@@ -134,6 +145,107 @@ def main():
     check("全局坐标读不到 ⇒ 仍让路（不许把角色吊在绳上）",
           _s._ladder_yield()[0], True)
 
+    print("\n【2b】route.rope_stuck_s 的真值表（0.0 = 本层关掉）")
+    check("缺键 ⇒ 默认 8.0", round(stub({})._rope_stuck_s(), 3), 8.0)
+    check("None ⇒ 8.0", round(stub({"route": {"rope_stuck_s": None}})._rope_stuck_s(), 3), 8.0)
+    check("字符串 '8' ⇒ 8.0",
+          round(stub({"route": {"rope_stuck_s": "8"}})._rope_stuck_s(), 3), 8.0)
+    check("3 ⇒ 3.0", round(stub({"route": {"rope_stuck_s": 3}})._rope_stuck_s(), 3), 3.0)
+    check("0 ⇒ 0.0（用户明确关掉本层）",
+          stub({"route": {"rope_stuck_s": 0}})._rope_stuck_s(), 0.0)
+    check("-1 ⇒ 0.0", stub({"route": {"rope_stuck_s": -1}})._rope_stuck_s(), 0.0)
+    check("121 ⇒ 0.0（明显写错，不猜）",
+          stub({"route": {"rope_stuck_s": 121}})._rope_stuck_s(), 0.0)
+    check("畸形 'abc' ⇒ 默认 8.0",
+          round(stub({"route": {"rope_stuck_s": "abc"}})._rope_stuck_s(), 3), 8.0)
+    check("全局坐标读不到 ⇒ 0.0（fail-closed：测不到进展就不敢替用户放弃）",
+          stub({"route": {"rope_stuck_s": 8}}, loc_player_global=None)._rope_stuck_s(), 0.0)
+
+    print("\n【2c】爬绳 give-up：≥8s 没进展 ⇒ 暂停爬绳（怪逻辑恢复）")
+    _now = time.time()
+    # (a) 才爬 3s ⇒ 照旧让路（老行为不变）
+    _s = stub({}, cmd_move_y="up", _rope_req_t0=_now - 3.0, _rope_req_cmd="up",
+              t_ladder_move=_now - 3.0)
+    check("路线要 up、才 3s 没进展 ⇒ 仍让路（老行为不变）", _s._ladder_yield()[0], True)
+    check("……且还没进 give-up 窗口", _s._rope_giveup_now(), False)
+    # (b) 爬了 9s 还没动 ⇒ 放弃
+    _s = stub({}, cmd_move_y="up", _rope_req_t0=_now - 9.0, _rope_req_cmd="up",
+              t_ladder_move=_now - 9.0)
+    _y, _why = _s._ladder_yield()
+    check("路线要 up、9s 没进展 ⇒ **不让路**（那 17% 的静音在这条上解掉）", _y, False)
+    check_true("……并且真的进了 give-up 窗口", _s._rope_giveup_now())
+    check("……理由文案为空（让路块据此不再打印「让路」）", _why, "")
+    check("……窗口长度 = rope_stuck_s（8s）",
+          round(float(_s._rope_giveup_until) - _now, 1), 8.0)
+    # (c) 窗口内再问 ⇒ 仍不让路
+    check("窗口内再问 ⇒ 仍不让路", _s._ladder_yield()[0], False)
+    # (d) 窗口里真出现竖向进展 ⇒ 立刻取消（绝不在人已经爬上去时抢控制权）
+    _s.t_ladder_move = time.time()
+    check("暂停期间出现竖向进展 ⇒ 立刻取消暂停（控制权还给路线）",
+          _s._ladder_yield()[0], True)
+    check("……窗口已清零", _s._rope_giveup_now(), False)
+    # (e) 暂停结束后重新起表
+    _now2 = time.time()
+    _s = stub({}, cmd_move_y="up", _rope_req_t0=_now2, _rope_req_cmd="up",
+              t_ladder_move=_now2 - 100.0, _rope_giveup_until=_now2 - 1.0)
+    check("暂停结束后重新起表 ⇒ 先让路（新的一次尝试）", _s._ladder_yield()[0], True)
+    # (f) 关掉本层 ⇒ 无论多久都让路
+    _s = stub({"route": {"rope_stuck_s": 0}}, cmd_move_y="up",
+              _rope_req_t0=_now - 600.0, _rope_req_cmd="up", t_ladder_move=_now - 600.0)
+    check("rope_stuck_s=0（关掉本层）⇒ 600s 也让路（旧行为）", _s._ladder_yield()[0], True)
+    check("……且不建窗口", _s._rope_giveup_now(), False)
+    # (g) 真在爬（竖向进展新鲜）⇒ 绝不打断
+    _s = stub({}, cmd_move_y="up", is_on_ladder=True, _rope_req_t0=_now - 9.0,
+              _rope_req_cmd="up", t_ladder_move=_now - 0.1)
+    check("在梯子上且刚有竖向进展 ⇒ 让路（绝不因超时把爬梯打断）",
+          _s._ladder_yield()[0], True)
+
+    print("\n【2d】爬梯走完 route.ladder_finish：在梯上、路线没给上下 ⇒ 补竖向")
+    # 背景（用户 m11669「上梯子要走完，不要检测怪了」+ 真机取证）：梯子上按左右
+    # **不动**，而路线这帧可能只给横向像素 ⇒ 键在发、人不动。补上竖向之后
+    # `_ladder_yield()` 的"路线给 up/down ⇒ 始终让路"自然生效 ⇒ 怪逻辑静音。
+    _s = stub({}, is_on_ladder=False)
+    check("不在梯子上 ⇒ 不补（本层只信 is_on_ladder）", _s._ladder_finish_tick(), "")
+    _s = stub({}, is_on_ladder=True, cmd_move_y="up")
+    check("路线自己给了 up ⇒ 不补（不让路那条已经管了）", _s._ladder_finish_tick(), "")
+    _s = stub({}, is_on_ladder=True, cmd_move_y="none", cmd_move_x="right",
+              cmd_action="none")
+    check("★在梯上、路线这帧只给横向（right none none）⇒ 补 up",
+          _s._ladder_finish_tick(), "up")
+    check_true("……并且真的起了表（超时判据要用）", _s._ladder_push_t0 > 0.0)
+    _s = stub({}, is_on_ladder=True, _last_vert_cmd="down")
+    check("方向跟随路线最近一次竖向（down）⇒ 补 down", _s._ladder_finish_tick(), "down")
+    _s = stub({}, is_on_ladder=True, _last_vert_cmd="啥也不是")
+    check("方向值畸形 ⇒ 退回 up（不猜）", _s._ladder_finish_tick(), "up")
+    _s = stub({}, is_on_ladder=True, _rope_giveup_until=time.time() + 3.0)
+    check("P0 的爬绳放弃窗口里 ⇒ 不抢（那几秒归 route.rope_stuck_s）",
+          _s._ladder_finish_tick(), "")
+    _now = time.time()
+    _s = stub({}, is_on_ladder=True, _ladder_push_t0=_now - 7.0,
+              t_ladder_move=_now - 100.0)
+    check("补了 7s、全局 y 一直没动 ⇒ 停手（按上去也没用）",
+          _s._ladder_finish_tick(), "")
+    check("……冷却 = 同样长的时间（6s）", round(_s._ladder_push_cool - _now, 1), 6.0)
+    check("……起表清零（下次重新算）", _s._ladder_push_t0, 0.0)
+    check("……冷却期内再问也不补", _s._ladder_finish_tick(), "")
+    _s = stub({}, is_on_ladder=True, _ladder_push_t0=_now - 30.0,
+              t_ladder_move=_now - 0.5)
+    check("补了 30s 但刚有竖向进展 ⇒ 继续补（真在爬就绝不撒手）",
+          _s._ladder_finish_tick(), "up")
+    _s = stub({"route": {"ladder_finish": False}}, is_on_ladder=True)
+    check("ladder_finish: false ⇒ 不补（逐字退回老行为）",
+          _s._ladder_finish_tick(), "")
+    _s = stub({"route": {"ladder_finish_s": 0}}, is_on_ladder=True)
+    check("ladder_finish_s: 0 ⇒ 不补", _s._ladder_finish_tick(), "")
+    check("参数缺键 ⇒ (True, 6.0)", stub({})._ladder_finish_cfg(), (True, 6.0))
+    check("参数 NaN ⇒ (True, 6.0)",
+          stub({"route": {"ladder_finish_s": float("nan")}})._ladder_finish_cfg(),
+          (True, 6.0))
+    check("参数 121 ⇒ (True, 6.0)（明显写错，不猜）",
+          stub({"route": {"ladder_finish_s": 121}})._ladder_finish_cfg(), (True, 6.0))
+    check("参数 '3.5' ⇒ (True, 3.5)",
+          stub({"route": {"ladder_finish_s": "3.5"}})._ladder_finish_cfg(), (True, 3.5))
+
     print("\n【3】接线白盒（源码断言）")
     _src = inspect.getsource(MapleStoryAutoBot)
     _yield_src = inspect.getsource(MapleStoryAutoBot.update_cmd_by_mob_detection)
@@ -164,6 +276,53 @@ def main():
                "self.t_ladder_stale_log = 0.0"):
         check_true(f"__init__ 里有 {_f}", _f in _src)
 
+    # ★ 2026-10-14（P0，用户 m10830）：爬绳超时 ⇒ 暂停爬绳 + 怪逻辑恢复。
+    check_true("_rope_stuck_s 全文件只定义一次",
+               _src.count("def _rope_stuck_s(self):") == 1)
+    check_true("_rope_ladder_giveup_tick 全文件只定义一次",
+               _src.count("def _rope_ladder_giveup_tick(self):") == 1)
+    check_true("状态机每帧只被 _ladder_yield() 问一次（唯一写状态处）",
+               _src.count("self._rope_ladder_giveup_tick()") == 1)
+    check_true("让路块里 give-up 会真的打断让路",
+               "if _giveup:" in _src and "把控制权交回怪逻辑" in _src)
+    _route_src = inspect.getsource(MapleStoryAutoBot.update_cmd_by_route)
+    check_true("路线侧真把 up/down 压成 none（不只是让路，也不死按着键）",
+               "self._rope_giveup_now()" in _route_src
+               and 'self.cmd_move_y = "none"' in
+               _route_src.split("self._rope_giveup_now()")[1][:200])
+    check_true("压的只是竖向（横向/动作照旧，不许把整条指令清掉）",
+               'self.cmd_move_x = "none"' not in
+               _route_src.split("self._rope_giveup_now()")[1][:200])
+    check_true("日志点名怎么关掉（route.rope_stuck_s 填 0）",
+               "`route.rope_stuck_s` 填 0 = 关掉本层" in _src)
+    check_true("give-up 是可核对的（日志带「已 Ns、期间没有竖向进展」）",
+               "期间没有竖向进展" in _src and "判定这根绳上不去" in _src)
+
+    # ★ 2026-10-15（爬梯走完，用户 m11669）：路线侧替路线补竖向。
+    check_true("_ladder_finish_tick 全文件只定义一次",
+               _src.count("def _ladder_finish_tick(self):") == 1)
+    check_true("_ladder_finish_cfg 是读这两个键的唯一入口",
+               _src.count("def _ladder_finish_cfg(self):") == 1)
+    check_true("路线侧真把竖向补上（不只是判据、不是写了不接）",
+               "self._ladder_finish_tick()" in _route_src
+               and "self.cmd_move_y = _ladder_push" in _route_src)
+    check_true("补的只是竖向（不许顺手改横向/动作）",
+               "self.cmd_move_x = _ladder_push" not in _route_src
+               and "self.cmd_action = _ladder_push" not in _route_src)
+    check_true("只记「路线最近一次给的竖向」（补的时候要用）",
+               "self._last_vert_cmd = str(self.cmd_move_y)" in _route_src)
+    _fin_src = _src.split("def _ladder_finish_tick")[1].split(
+        "def update_cmd_by_mob_detection")[0]
+    check_true("与 P0 的窗口不打架（rope_stuck_s 生效那几秒本层不抢）",
+               "_rope_giveup_now()" in _fin_src)
+    check_true("超时会冷却（不在梯子顶端把横向走位一直压住）",
+               "_ladder_push_cool" in _fin_src and "冷却" in _fin_src)
+    check_true("日志点名怎么关掉（route.ladder_finish_s 填 0）",
+               "`route.ladder_finish_s` 填 0 = 关掉本层" in _src)
+    for _f in ('self._last_vert_cmd = "up"', "self._ladder_push_t0 = 0.0",
+               "self._ladder_push_cool = 0.0", "self.t_ladder_finish_log = 0.0"):
+        check_true(f"__init__ 里有 {_f}", _f in _src)
+
     print("\n【4】配置 / 界面口径")
     with open(os.path.join(_ROOT, "config", "config_default.yaml"), encoding="utf-8") as _fh:
         _cfg = yaml.safe_load(_fh)
@@ -175,6 +334,29 @@ def main():
     import src.ui.ui as _ui                                        # noqa: E402
     check_true("界面高级设置里收着（算法判据，放出来只会把爬梯搞坏）",
                "ladder_still_s" in _ui.ADV_FIELD_HIDE.get("route", []))
+    check("出厂 route.rope_stuck_s = 8.0", _cfg["route"].get("rope_stuck_s"), 8.0)
+    _cn2 = cn_key("route", "rope_stuck_s")
+    check_true("有中文名（[爬绳] 那行点名这个键，用户去 yaml 里能对上）",
+               _cn2 != "rope_stuck_s" and "爬绳" in _cn2, _cn2)
+    check_true("界面高级设置里也收着（同 rope_nudge_* 口径：算法判据）",
+               "rope_stuck_s" in _ui.ADV_FIELD_HIDE.get("route", []))
+    check_true("出厂注释块写清了判据与关掉的办法",
+               "rope_stuck_s" in open(os.path.join(_ROOT, "config", "config_default.yaml"),
+                                      encoding="utf-8").read())
+    _yaml_txt = open(os.path.join(_ROOT, "config", "config_default.yaml"),
+                     encoding="utf-8").read()
+    check("出厂 route.ladder_finish = True", _cfg["route"].get("ladder_finish"), True)
+    check("出厂 route.ladder_finish_s = 6.0", _cfg["route"].get("ladder_finish_s"), 6.0)
+    _cn3 = cn_key("route", "ladder_finish")
+    check_true("有中文名（[爬梯] 那行点名这个键，用户去 yaml 里能对上）",
+               _cn3 != "ladder_finish" and "爬梯" in _cn3, _cn3)
+    _cn4 = cn_key("route", "ladder_finish_s")
+    check_true("秒数也有中文名", _cn4 != "ladder_finish_s" and "爬梯" in _cn4, _cn4)
+    check_true("界面高级设置里也收着（同上口径：算法判据）",
+               "ladder_finish" in _ui.ADV_FIELD_HIDE.get("route", [])
+               and "ladder_finish_s" in _ui.ADV_FIELD_HIDE.get("route", []))
+    check_true("出厂注释块写清了机制与真机取证",
+               "ladder_finish_s: 6.0" in _yaml_txt and "竖向 0/6 帧" in _yaml_txt)
 
     print("\n【5】真机样本回归（老规则 vs 新规则）")
     _files = sorted(glob.glob(os.path.join(_ROOT, "debug", "demo", "demo_*.jsonl*")))
